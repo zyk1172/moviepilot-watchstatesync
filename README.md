@@ -1,0 +1,31 @@
+# MoviePilot WatchStateSync
+
+一个用于在 MoviePilot 中同步 Plex 与 Jellyfin 观看进度的第三方插件仓库。
+
+当前实现为 V2 插件：
+
+- 插件目录：`plugins.v2/watchstatesync`
+- 索引文件：`package.v2.json`
+
+## 功能
+
+- 监听 MoviePilot 已接收的媒体服务器 Webhook 事件
+- 在 Plex 和 Jellyfin 之间同步：
+  - 已看/未看状态
+  - 继续观看进度
+- 支持单向或双向同步
+- 支持按用户名过滤事件，避免多用户串进度
+
+## 当前限制
+
+- 依赖 MoviePilot 先正确配置好 Plex/Jellyfin 媒体服务器
+- 依赖 MoviePilot 的 `/api/v1/webhook` 能收到对应媒体服务器事件
+- 目前按 MoviePilot 中配置的媒体服务器令牌写入目标端，因此更适合单用户场景
+- 首版以事件驱动同步为主，不做历史全量回填
+
+## 使用
+
+1. 将本仓库放到 GitHub。
+2. 在 MoviePilot V2 的插件市场添加仓库地址。
+3. 安装 `观看进度同步` 插件。
+4. 在插件配置页选择两个媒体服务器、同步方向，并按页面提示配置 webhook。
