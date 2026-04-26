@@ -10,6 +10,7 @@
 ## 功能
 
 - 监听 MoviePilot 已接收的媒体服务器 Webhook 事件
+- 在没有 Plex Pass 时，定时轮询 Plex 的播放历史与继续观看列表
 - 在 Plex 和 Jellyfin 之间同步：
   - 已看/未看状态
   - 继续观看进度
@@ -19,7 +20,8 @@
 ## 当前限制
 
 - 依赖 MoviePilot 先正确配置好 Plex/Jellyfin 媒体服务器
-- 依赖 MoviePilot 的 `/api/v1/webhook` 能收到对应媒体服务器事件
+- Jellyfin 建议继续通过 MoviePilot 的 `/api/v1/webhook` 接收事件
+- Plex 无 Plex Pass 时可不依赖 webhook，改用插件内置轮询
 - 目前按 MoviePilot 中配置的媒体服务器令牌写入目标端，因此更适合单用户场景
 - 首版以事件驱动同步为主，不做历史全量回填
 
@@ -28,4 +30,6 @@
 1. 将本仓库放到 GitHub。
 2. 在 MoviePilot V2 的插件市场添加仓库地址。
 3. 安装 `观看进度同步` 插件。
-4. 在插件配置页选择两个媒体服务器、同步方向，并按页面提示配置 webhook。
+4. 在插件配置页选择两个媒体服务器、同步方向。
+5. 如果 Jellyfin 参与同步，按页面提示配置 Jellyfin webhook。
+6. 如果 Plex 没有会员，开启插件中的 Plex 轮询。
