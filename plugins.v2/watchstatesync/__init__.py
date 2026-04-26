@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from app.core.event import Event, eventmanager
 from app.helper.mediaserver import MediaServerHelper
@@ -845,7 +846,9 @@ class WatchStateSync(_PluginBase):
                 year=state.year,
                 tmdb_id=state.tmdb_id
             ) or []
-            return items[0] if items else None
+            if items:
+                return items[0]
+            return self._find_jellyfin_movie_fallback(target_service, state)
 
         items = target_service.instance.get_movies(
             title=state.title,
@@ -867,6 +870,8 @@ class WatchStateSync(_PluginBase):
                 season=state.season
             )
             if not show_id:
+                show_id = self._find_jellyfin_series_id_fallback(target_service, state)
+            if not show_id:
                 return None
             return self._find_jellyfin_episode_item(target_service, show_id, state.season, state.episode)
 
@@ -886,7 +891,6 @@ class WatchStateSync(_PluginBase):
         server = target_service.instance
         url = f"{server._host}Shows/{show_id}/Episodes"
         params = {
-            "season": season,
             "userId": server.user,
             "isMissing": "false",
             "api_key": server._apikey
@@ -894,10 +898,160 @@ class WatchStateSync(_PluginBase):
         res = RequestUtils().get_res(url, params=params)
         if not res:
             return None
-        for item in res.json().get("Items", []):
-            if item.get("ParentIndexNumber") == season and item.get("IndexNumber") == episode:
-                return server.get_iteminfo(item.get("Id"))
+        items = res.json().get("Items", [])
+        exact_match = None
+        same_episode_candidates = []
+        for item in items:
+            parent_index = item.get("ParentIndexNumber")
+            episode_index = item.get("IndexNumber")
+            if parent_index == season and episode_index == episode:
+                exact_match = item
+                break
+            if episode_index == episode:
+                same_episode_candidates.append(item)
+        if exact_match:
+            return server.get_iteminfo(exact_match.get("Id"))
+        if len(same_episode_candidates) == 1:
+            logger.info(
+                f"观看进度同步：Jellyfin 季号未对齐，使用按集号兜底 "
+                f"S{season}E{episode} -> S{same_episode_candidates[0].get('ParentIndexNumber')}E{episode}"
+            )
+            return server.get_iteminfo(same_episode_candidates[0].get("Id"))
         return None
+
+    def _find_jellyfin_movie_fallback(
+        self, target_service: ServiceInfo, state: NormalizedState
+    ) -> Optional[MediaServerItem]:
+        server = target_service.instance
+        candidates = self._search_jellyfin_items(
+            server=server,
+            include_item_types="Movie",
+            terms=self._build_search_terms([state.title, state.original_title]),
+            limit=20
+        )
+        best = self._pick_best_jellyfin_match(candidates, state, media_kind="movie")
+        if best:
+            return server.get_iteminfo(best.get("Id"))
+        return None
+
+    def _find_jellyfin_series_id_fallback(
+        self, target_service: ServiceInfo, state: NormalizedState
+    ) -> Optional[str]:
+        server = target_service.instance
+        candidates = self._search_jellyfin_items(
+            server=server,
+            include_item_types="Series",
+            terms=self._build_search_terms([state.series_title, state.title, state.original_title]),
+            limit=30
+        )
+        best = self._pick_best_jellyfin_match(candidates, state, media_kind="episode")
+        if best:
+            logger.info(
+                f"观看进度同步：Jellyfin 剧集兜底匹配成功 "
+                f"{state.series_title or state.title} -> {best.get('Name')}"
+            )
+            return best.get("Id")
+        return None
+
+    def _search_jellyfin_items(
+        self, server: Any, include_item_types: str, terms: List[str], limit: int = 20
+    ) -> List[dict]:
+        all_items: List[dict] = []
+        seen_ids = set()
+        for term in terms:
+            url = f"{server._host}Users/{server.user}/Items"
+            params = {
+                "IncludeItemTypes": include_item_types,
+                "Fields": "ProviderIds,OriginalTitle,ProductionYear,Path,UserDataPlayCount,UserDataLastPlayedDate,ParentId",
+                "StartIndex": 0,
+                "Recursive": "true",
+                "searchTerm": term,
+                "Limit": limit,
+                "api_key": server._apikey
+            }
+            res = RequestUtils().get_res(url, params=params)
+            if not res:
+                continue
+            for item in res.json().get("Items", []):
+                item_id = item.get("Id")
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    all_items.append(item)
+        return all_items
+
+    def _pick_best_jellyfin_match(
+        self, candidates: List[dict], state: NormalizedState, media_kind: str
+    ) -> Optional[dict]:
+        if not candidates:
+            return None
+
+        target_titles = self._build_search_terms([state.series_title, state.title, state.original_title])
+        target_title_norms = {self._normalize_title(title) for title in target_titles if title}
+
+        best_item = None
+        best_score = -1
+        for item in candidates:
+            score = 0
+            provider_ids = item.get("ProviderIds") or {}
+            item_tmdb = self._coerce_int(provider_ids.get("Tmdb"))
+            item_tvdb = provider_ids.get("Tvdb")
+            item_imdb = provider_ids.get("Imdb")
+
+            if state.tmdb_id and item_tmdb and state.tmdb_id == item_tmdb:
+                score += 100
+            if state.tvdb_id and item_tvdb and str(state.tvdb_id) == str(item_tvdb):
+                score += 80
+            if state.imdb_id and item_imdb and str(state.imdb_id) == str(item_imdb):
+                score += 80
+
+            name_norm = self._normalize_title(item.get("Name"))
+            original_norm = self._normalize_title(item.get("OriginalTitle"))
+            if name_norm in target_title_norms:
+                score += 40
+            if original_norm and original_norm in target_title_norms:
+                score += 25
+
+            item_year = self._coerce_int(item.get("ProductionYear"))
+            if state.year and item_year and state.year == item_year:
+                score += 10
+
+            if media_kind == "episode" and item.get("Type") == "Series":
+                score += 5
+            if media_kind == "movie" and item.get("Type") == "Movie":
+                score += 5
+
+            if score > best_score:
+                best_score = score
+                best_item = item
+
+        if best_score >= 30:
+            return best_item
+        return None
+
+    @staticmethod
+    def _build_search_terms(values: List[Optional[str]]) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+        for value in values:
+            if not value:
+                continue
+            variants = [value.strip()]
+            compact = re.sub(r"\s+", "", value).strip()
+            if compact and compact not in variants:
+                variants.append(compact)
+            for variant in variants:
+                if variant and variant not in seen:
+                    seen.add(variant)
+                    terms.append(variant)
+        return terms
+
+    @staticmethod
+    def _normalize_title(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        value = value.lower().strip()
+        value = re.sub(r"[\s\-_:：!！?？,，。·'\"“”‘’\(\)\[\]【】]+", "", value)
+        return value
 
     def _find_plex_episode_item(
         self, target_service: ServiceInfo, show_key: str, season: int, episode: int
