@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from app.core.event import Event, eventmanager
+from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -42,7 +43,7 @@ class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -101,7 +102,7 @@ class WatchStateSync(_PluginBase):
         return [{
             "path": "/clear_history",
             "endpoint": self.clear_history,
-            "methods": ["GET"],
+            "methods": ["GET", "POST"],
             "summary": "清除插件历史数据",
             "description": "清空同步记录，并重置 Plex 轮询历史游标与继续观看快照。"
         }]
@@ -429,7 +430,7 @@ class WatchStateSync(_PluginBase):
                                     "class": "mt-3",
                                     "color": "error",
                                     "variant": "tonal",
-                                    "href": "/api/v1/plugin/WatchStateSync/clear_history",
+                                    "href": f"/api/v1/plugin/WatchStateSync/clear_history?apikey={settings.API_TOKEN}",
                                     "text": "清除历史数据"
                                 }
                             }
