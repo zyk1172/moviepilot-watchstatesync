@@ -43,7 +43,7 @@ class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -1126,33 +1126,44 @@ class WatchStateSync(_PluginBase):
         self, target_service: ServiceInfo, target_item: MediaServerItem, state: NormalizedState
     ) -> Tuple[bool, str]:
         server = target_service.instance
-        url = f"{server._host}Users/{server.user}/Items/{target_item.item_id}"
-        params = {"api_key": server._apikey}
-        res = RequestUtils().get_res(url, params=params)
-        if not res:
-            return False, "read target userdata failed"
-
-        body = (res.json().get("UserData") or {}).copy()
-        body["ItemId"] = target_item.item_id
-        body["PlaybackPositionTicks"] = max(state.progress_ms, 0) * 10000
-        body["Played"] = state.watched
-        body["PlayCount"] = max(self._safe_int(body.get("PlayCount"), 0), 1 if state.watched else 0)
-        body["PlayedPercentage"] = 100 if state.watched else round(state.percent, 2)
-        body["LastPlayedDate"] = state.played_at or datetime.now(timezone.utc).isoformat()
-        if state.watched:
-            body["PlaybackPositionTicks"] = 0
         headers = {
-            "Content-Type": "application/json",
             "X-Emby-Token": server._apikey
         }
-        update_url = f"{server._host}UserItems/{target_item.item_id}/UserData"
-        update_res = RequestUtils(headers=headers, content_type="application/json").post_res(
-            update_url, params={"api_key": server._apikey}, json=body
-        )
-        if not update_res or update_res.status_code >= 300:
-            code = update_res.status_code if update_res else "n/a"
-            return False, f"write jellyfin failed ({code})"
-        return True, f"jellyfin:{target_item.item_id}"
+        base_params = {
+            "api_key": server._apikey,
+            "userId": server.user
+        }
+
+        if state.watched:
+            watched_url = f"{server._host}UserPlayedItems/{target_item.item_id}"
+            watched_res = RequestUtils(headers=headers).post_res(watched_url, params=base_params)
+            if not watched_res or watched_res.status_code >= 300:
+                code = watched_res.status_code if watched_res else "n/a"
+                return False, f"write jellyfin watched failed ({code})"
+            return True, f"jellyfin watched:{target_item.item_id}"
+
+        if state.progress_ms <= 0:
+            unplayed_url = f"{server._host}UserPlayedItems/{target_item.item_id}"
+            unplayed_res = RequestUtils(headers=headers).delete_res(unplayed_url, params=base_params)
+            if not unplayed_res or unplayed_res.status_code >= 300:
+                code = unplayed_res.status_code if unplayed_res else "n/a"
+                return False, f"write jellyfin unplayed failed ({code})"
+            return True, f"jellyfin unplayed:{target_item.item_id}"
+
+        # 继续观看需要确保条目不是已看，再上报当前进度。
+        unplayed_url = f"{server._host}UserPlayedItems/{target_item.item_id}"
+        unplayed_res = RequestUtils(headers=headers).delete_res(unplayed_url, params=base_params)
+        if unplayed_res and unplayed_res.status_code >= 300:
+            logger.warning(f"观看进度同步：Jellyfin 预清除已看状态失败 {unplayed_res.status_code}")
+
+        progress_params = base_params.copy()
+        progress_params["PositionTicks"] = max(state.progress_ms, 0) * 10000
+        progress_url = f"{server._host}PlayingItems/{target_item.item_id}/Progress"
+        progress_res = RequestUtils(headers=headers).post_res(progress_url, params=progress_params)
+        if not progress_res or progress_res.status_code >= 300:
+            code = progress_res.status_code if progress_res else "n/a"
+            return False, f"write jellyfin progress failed ({code})"
+        return True, f"jellyfin progress:{target_item.item_id}"
 
     def _apply_to_plex(
         self, target_service: ServiceInfo, target_item: MediaServerItem, state: NormalizedState
