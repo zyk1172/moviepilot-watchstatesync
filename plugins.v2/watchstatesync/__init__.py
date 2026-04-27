@@ -1102,7 +1102,7 @@ class WatchStateSync(_PluginBase):
         }
         update_url = f"{server._host}UserItems/{target_item.item_id}/UserData"
         update_res = RequestUtils(headers=headers, content_type="application/json").post_res(
-            update_url, json=body
+            update_url, params={"api_key": server._apikey}, json=body
         )
         if not update_res or update_res.status_code >= 300:
             code = update_res.status_code if update_res else "n/a"
