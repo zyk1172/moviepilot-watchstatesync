@@ -1,9 +1,9 @@
 {
   "WatchStateSync": {
     "name": "观看进度同步",
-    "description": "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。",
-    "labels": "媒体服务器,同步,Plex,Jellyfin",
-    "version": "1.0.4",
+    "description": "[Beta] 在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。",
+    "labels": "媒体服务器,同步,Plex,Jellyfin,Beta,实验性",
+    "version": "1.0.5",
     "icon": "sync_file.png",
     "author": "OpenAI Codex",
     "level": 1,

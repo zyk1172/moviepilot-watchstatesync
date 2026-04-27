@@ -43,7 +43,7 @@ class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
