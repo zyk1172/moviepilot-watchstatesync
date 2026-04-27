@@ -43,7 +43,7 @@ class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -64,12 +64,16 @@ class WatchStateSync(_PluginBase):
     _dry_run = False
     _poll_plex = True
     _poll_interval_minutes = 5
+    _jellyfin_username = ""
+    _jellyfin_password = ""
 
     _lock = threading.Lock()
     _recent_writes: Dict[str, float] = {}
     _recent_failures: Dict[str, float] = {}
     _write_ttl_seconds = 180
     _max_history = 30
+    _jellyfin_auth_cache: Dict[str, Dict[str, Any]] = {}
+    _jellyfin_auth_ttl_seconds = 3600
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -86,6 +90,8 @@ class WatchStateSync(_PluginBase):
         self._dry_run = bool(config.get("dry_run", False))
         self._poll_plex = bool(config.get("poll_plex", True))
         self._poll_interval_minutes = max(1, self._safe_int(config.get("poll_interval_minutes"), 5))
+        self._jellyfin_username = (config.get("jellyfin_username") or "").strip()
+        self._jellyfin_password = config.get("jellyfin_password") or ""
         self._allowed_users = [
             user.strip() for user in (config.get("allowed_users") or "").split(",") if user.strip()
         ]
@@ -336,13 +342,41 @@ class WatchStateSync(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "jellyfin_username",
+                                        "label": "Jellyfin 用户名（用于继续观看写回）"
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "jellyfin_password",
+                                        "label": "Jellyfin 密码（用于继续观看写回）",
+                                        "type": "password"
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [{
                                     "component": "VAlert",
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": "请在 Plex/Jellyfin 的 webhook 中回调到 MoviePilot: /api/v1/webhook?token=API_TOKEN&source=媒体服务器名。Plex 建议开启 media.stop 与 media.scrobble；Jellyfin 建议开启 PlaybackStop。"
+                                        "text": "请在 Plex/Jellyfin 的 webhook 中回调到 MoviePilot: /api/v1/webhook?token=API_TOKEN&source=媒体服务器名。Plex 建议开启 media.stop 与 media.scrobble；Jellyfin 建议开启 PlaybackStop。继续观看写回需要额外填写 Jellyfin 用户名和密码。"
                                     }
                                 }]
                             }
@@ -364,7 +398,9 @@ class WatchStateSync(_PluginBase):
             "notify_on_sync": False,
             "dry_run": False,
             "poll_plex": True,
-            "poll_interval_minutes": 5
+            "poll_interval_minutes": 5,
+            "jellyfin_username": "",
+            "jellyfin_password": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -1126,13 +1162,11 @@ class WatchStateSync(_PluginBase):
         self, target_service: ServiceInfo, target_item: MediaServerItem, state: NormalizedState
     ) -> Tuple[bool, str]:
         server = target_service.instance
-        headers = {
-            "X-Emby-Token": server._apikey
-        }
-        base_params = {
-            "api_key": server._apikey,
-            "userId": server.user
-        }
+        auth_context = self._get_jellyfin_auth_context(server)
+        if not auth_context:
+            return False, "missing jellyfin login"
+        headers = auth_context["headers"]
+        base_params = auth_context["params"]
 
         if state.watched:
             watched_url = f"{server._host}UserPlayedItems/{target_item.item_id}"
@@ -1296,6 +1330,7 @@ class WatchStateSync(_PluginBase):
             if force:
                 self._recent_writes = {}
                 self._recent_failures = {}
+                self._jellyfin_auth_cache = {}
                 return
             self._cleanup_caches_locked()
 
@@ -1330,6 +1365,60 @@ class WatchStateSync(_PluginBase):
             "history_count": history_count,
             "reset_keys": reset_keys
         }
+
+    def _get_jellyfin_auth_context(self, server: Any) -> Optional[Dict[str, Any]]:
+        if not self._jellyfin_username or not self._jellyfin_password:
+            return None
+
+        host = server._host.rstrip("/")
+        with self._lock:
+            cached = self._jellyfin_auth_cache.get(host)
+            if cached and (time.time() - self._safe_int(cached.get("ts"), 0)) < self._jellyfin_auth_ttl_seconds:
+                return cached.get("context")
+
+        auth_url = f"{host}/Users/AuthenticateByName"
+        auth_headers = {
+            "Content-Type": "application/json",
+            "X-Emby-Authorization": (
+                f'MediaBrowser Client="MoviePilotWatchStateSync", Device="MoviePilot", '
+                f'DeviceId="watchstatesync", Version="{self.plugin_version}"'
+            )
+        }
+        payload = {
+            "Username": self._jellyfin_username,
+            "Pw": self._jellyfin_password
+        }
+        res = RequestUtils(headers=auth_headers, content_type="application/json").post_res(
+            auth_url,
+            json=payload
+        )
+        if not res or res.status_code >= 300:
+            logger.error(
+                f"观看进度同步：Jellyfin 登录失败 {res.status_code if res else 'n/a'}"
+            )
+            return None
+
+        data = res.json() or {}
+        access_token = data.get("AccessToken")
+        user_id = ((data.get("User") or {}).get("Id")) or server.user
+        if not access_token or not user_id:
+            logger.error("观看进度同步：Jellyfin 登录返回缺少 access token 或 user id")
+            return None
+
+        context = {
+            "headers": {
+                "X-Emby-Token": access_token
+            },
+            "params": {
+                "userId": user_id
+            }
+        }
+        with self._lock:
+            self._jellyfin_auth_cache[host] = {
+                "ts": time.time(),
+                "context": context
+            }
+        return context
 
     def _record_history(self, title: str, subtitle: str):
         history = self.get_data("history") or []
