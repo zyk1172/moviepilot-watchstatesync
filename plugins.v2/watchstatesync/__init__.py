@@ -42,7 +42,7 @@ class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -98,7 +98,13 @@ class WatchStateSync(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [{
+            "path": "/clear_history",
+            "endpoint": self.clear_history,
+            "methods": ["GET"],
+            "summary": "清除插件历史数据",
+            "description": "清空同步记录，并重置 Plex 轮询历史游标与继续观看快照。"
+        }]
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled or not self._poll_plex:
@@ -405,6 +411,36 @@ class WatchStateSync(_PluginBase):
                 "component": "VCard",
                 "props": {"class": "mt-3"},
                 "content": [
+                    {"component": "VCardTitle", "text": "历史数据"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "warning",
+                                    "variant": "tonal",
+                                    "text": "清除后会同时重置最近同步记录和 Plex 轮询游标。下一轮轮询会重新处理最近一批 Plex 历史与继续观看数据。"
+                                }
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "class": "mt-3",
+                                    "color": "error",
+                                    "variant": "tonal",
+                                    "href": "/api/v1/plugin/WatchStateSync/clear_history",
+                                    "text": "清除历史数据"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "component": "VCard",
+                "props": {"class": "mt-3"},
+                "content": [
                     {"component": "VCardTitle", "text": "最近同步"},
                     {"component": "VCardText", "content": history_rows}
                 ]
@@ -477,6 +513,14 @@ class WatchStateSync(_PluginBase):
 
         if ok and self._notify_on_sync:
             self.post_message(title=title, text=subtitle)
+
+    def clear_history(self):
+        cleared = self._clear_history_data()
+        return {
+            "success": True,
+            "message": "已清除历史数据",
+            "data": cleared
+        }
 
     def stop_service(self):
         self._cleanup_caches(force=True)
@@ -1252,6 +1296,27 @@ class WatchStateSync(_PluginBase):
         self._recent_failures = {
             key: ts for key, ts in self._recent_failures.items()
             if (now - ts) < self._write_ttl_seconds
+        }
+
+    def _clear_history_data(self) -> Dict[str, Any]:
+        history_count = len(self.get_data("history") or [])
+        self.save_data("history", [])
+
+        reset_keys = []
+        for service_name in [self._server_a, self._server_b]:
+            if not service_name:
+                continue
+            history_key = f"plex_history_ts::{service_name}"
+            snapshot_key = f"plex_resume_snapshot::{service_name}"
+            self.save_data(history_key, 0)
+            self.save_data(snapshot_key, {})
+            reset_keys.extend([history_key, snapshot_key])
+
+        self._cleanup_caches(force=True)
+        logger.info("观看进度同步：已清除历史数据并重置轮询游标")
+        return {
+            "history_count": history_count,
+            "reset_keys": reset_keys
         }
 
     def _record_history(self, title: str, subtitle: str):
