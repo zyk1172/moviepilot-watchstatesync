@@ -41,9 +41,9 @@ class NormalizedState:
 
 class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
-    plugin_desc = "在 Plex 和 Jellyfin 之间同步已看状态与继续观看进度。"
+    plugin_desc = "将 Plex 的已看状态与继续观看进度单向同步到 Jellyfin。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.1.0"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -53,7 +53,6 @@ class WatchStateSync(_PluginBase):
     _enabled = False
     _server_a = ""
     _server_b = ""
-    _direction = "two_way"
     _allowed_users: List[str] = []
     _sync_watched = True
     _sync_progress = True
@@ -80,7 +79,6 @@ class WatchStateSync(_PluginBase):
         self._enabled = bool(config.get("enabled", False))
         self._server_a = (config.get("server_a") or "").strip()
         self._server_b = (config.get("server_b") or "").strip()
-        self._direction = config.get("direction") or "two_way"
         self._sync_watched = bool(config.get("sync_watched", True))
         self._sync_progress = bool(config.get("sync_progress", True))
         self._min_progress_seconds = self._safe_int(config.get("min_progress_seconds"), 60)
@@ -185,7 +183,7 @@ class WatchStateSync(_PluginBase):
                                     "component": "VSelect",
                                     "props": {
                                         "model": "server_a",
-                                        "label": "媒体服务器 A",
+                                        "label": "Plex 源服务器",
                                         "items": server_items,
                                         "clearable": True
                                     }
@@ -198,30 +196,9 @@ class WatchStateSync(_PluginBase):
                                     "component": "VSelect",
                                     "props": {
                                         "model": "server_b",
-                                        "label": "媒体服务器 B",
+                                        "label": "Jellyfin 目标服务器",
                                         "items": server_items,
                                         "clearable": True
-                                    }
-                                }]
-                            }
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [{
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "direction",
-                                        "label": "同步方向",
-                                        "items": [
-                                            {"title": "双向同步", "value": "two_way"},
-                                            {"title": "A -> B", "value": "a_to_b"},
-                                            {"title": "B -> A", "value": "b_to_a"}
-                                        ]
                                     }
                                 }]
                             }
@@ -376,7 +353,7 @@ class WatchStateSync(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": "请在 Plex/Jellyfin 的 webhook 中回调到 MoviePilot: /api/v1/webhook?token=API_TOKEN&source=媒体服务器名。Plex 建议开启 media.stop 与 media.scrobble；Jellyfin 建议开启 PlaybackStop。继续观看写回需要额外填写 Jellyfin 用户名和密码。"
+                                        "text": "当前仓库为 Plex -> Jellyfin 单向同步。Plex 无会员时建议开启轮询；Jellyfin 继续观看写回需要额外填写 Jellyfin 用户名和密码。"
                                     }
                                 }]
                             }
@@ -388,7 +365,6 @@ class WatchStateSync(_PluginBase):
             "enabled": False,
             "server_a": "",
             "server_b": "",
-            "direction": "two_way",
             "sync_watched": True,
             "sync_progress": True,
             "min_progress_seconds": 60,
@@ -411,7 +387,7 @@ class WatchStateSync(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "text": "还没有同步记录。确认 webhook 已经打到 MoviePilot，并且两个媒体服务器都已在插件中选中。"
+                    "text": "还没有同步记录。确认已经正确选择 Plex 源服务器和 Jellyfin 目标服务器。"
                 }
             }]
         else:
@@ -438,8 +414,8 @@ class WatchStateSync(_PluginBase):
                         "component": "VCardText",
                         "text": (
                             f"状态：{'已启用' if self._enabled else '未启用'} | "
-                            f"方向：{self._direction} | "
-                            f"服务器：{self._server_a or '-'} / {self._server_b or '-'}"
+                            f"方向：Plex -> Jellyfin | "
+                            f"服务器：{self._server_a or '-'} -> {self._server_b or '-'}"
                         )
                     }
                 ]
@@ -494,7 +470,7 @@ class WatchStateSync(_PluginBase):
             return
 
         source_server = event_info.server_name
-        if not source_server or source_server not in [self._server_a, self._server_b]:
+        if not source_server or source_server != self._server_a:
             return
 
         if self._allowed_users:
@@ -565,22 +541,22 @@ class WatchStateSync(_PluginBase):
     def poll_plex_sources(self):
         if not self._enabled or not self._poll_plex:
             return
-        for source_server in [self._server_a, self._server_b]:
-            if not source_server:
-                continue
-            target_server = self._resolve_target_server(source_server)
-            if not target_server:
-                continue
-            source_service = self._get_service(source_server)
-            target_service = self._get_service(target_server)
-            if not source_service or not target_service:
-                continue
-            if source_service.type != "plex":
-                continue
-            try:
-                self._poll_single_plex_source(source_service, target_service)
-            except Exception as err:
-                logger.error(f"观看进度同步：轮询 Plex 源 {source_server} 失败 {err}")
+        if not self._server_a or not self._server_b:
+            return
+        source_service = self._get_service(self._server_a)
+        target_service = self._get_service(self._server_b)
+        if not source_service or not target_service:
+            return
+        if source_service.type != "plex":
+            logger.warning("观看进度同步：Plex 源服务器配置无效")
+            return
+        if target_service.type != "jellyfin":
+            logger.warning("观看进度同步：Jellyfin 目标服务器配置无效")
+            return
+        try:
+            self._poll_single_plex_source(source_service, target_service)
+        except Exception as err:
+            logger.error(f"观看进度同步：轮询 Plex 源 {self._server_a} 失败 {err}")
 
     def _get_service(self, service_name: str) -> Optional[ServiceInfo]:
         service = MediaServerHelper().get_service(name=service_name)
@@ -595,31 +571,18 @@ class WatchStateSync(_PluginBase):
     def _resolve_target_server(self, source_server: str) -> Optional[str]:
         if not self._server_a or not self._server_b or self._server_a == self._server_b:
             return None
-        if source_server == self._server_a:
-            if self._direction in ["two_way", "a_to_b"]:
-                return self._server_b
-            return None
-        if source_server == self._server_b:
-            if self._direction in ["two_way", "b_to_a"]:
-                return self._server_a
-            return None
-        return None
+        return self._server_b if source_server == self._server_a else None
 
     def _build_state(self, service: ServiceInfo, event_info: WebhookEventInfo) -> Optional[NormalizedState]:
-        if service.type == "jellyfin":
-            return self._build_jellyfin_state(service, event_info)
         if service.type == "plex":
             return self._build_plex_state(service, event_info)
         return None
 
     def _has_plex_source(self) -> bool:
-        for service_name in [self._server_a, self._server_b]:
-            if not service_name:
-                continue
-            service = MediaServerHelper().get_service(name=service_name)
-            if service and service.type == "plex" and self._resolve_target_server(service_name):
-                return True
-        return False
+        if not self._server_a:
+            return False
+        service = MediaServerHelper().get_service(name=self._server_a)
+        return bool(service and service.type == "plex" and self._resolve_target_server(self._server_a))
 
     def _poll_single_plex_source(self, source_service: ServiceInfo, target_service: ServiceInfo):
         self._poll_plex_history(source_service, target_service)
