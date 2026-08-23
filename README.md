@@ -30,7 +30,7 @@
 
 - 依赖 MoviePilot 先正确配置好 Plex 和 Jellyfin 媒体服务器
 - 更适合单用户场景
-- 多用户 Plex 请填写“允许同步的用户名或 Plex accountId”；WebSocket 会通过 `sessionKey` 查询当前播放用户，无法确认用户时会跳过该事件并等待轮询
+- 多用户 Plex 请填写“允许同步的用户名或 Plex accountId”；WebSocket 会通过 `sessionKey` 查询当前播放用户并优先使用通知中的用户进度，History/轮询在 PlexAPI 支持 `switchUser()` 时切换到该用户读取状态；无法切换时会跳过，避免误读 token owner 的状态
 - 不做历史全量回填
 - 媒体匹配仍依赖 Plex/Jellyfin 两边刮削结果尽量一致
 - 双向同步已从仓库定位中移除
@@ -61,5 +61,5 @@
 - `已看状态` 目前比 `继续观看进度` 更稳
 - Jellyfin 继续观看必须使用用户登录态 token；仅 API Key 不会执行进度写回
 - 每次写回后都会重新读取 Jellyfin UserData；验证失败会重试一次并保留 Outbox
-- Outbox 保存源事件时间和序列号；检测到同一媒体用户已有更新事件或目标已有更高进度时，会丢弃旧重试，避免进度倒退
+- Outbox 保存源事件时间和序列号；同一媒体用户只保留最新待处理状态，检测到目标已有更高进度时会丢弃旧重试，避免进度倒退
 - 当前插件实现仍是 MoviePilot V2（`package.v2.json` / `plugins.v2`），不包含 V3 实现

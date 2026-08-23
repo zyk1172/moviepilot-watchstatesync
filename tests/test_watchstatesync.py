@@ -1,8 +1,10 @@
 import importlib.util
 import sys
 import threading
+import time
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -119,10 +121,12 @@ class PlexItem:
 
 
 class FakePlex:
-    def __init__(self, items=None, sessions=None):
+    def __init__(self, items=None, sessions=None, user_servers=None):
         self.items = items or {}
         self.fetches = []
         self._sessions = sessions or []
+        self.user_servers = user_servers or {}
+        self.switches = []
 
     def fetchItem(self, key):
         self.fetches.append(key)
@@ -130,6 +134,23 @@ class FakePlex:
 
     def systemAccount(self, account_id):
         return types.SimpleNamespace(id=account_id, title="alice")
+
+    def myPlexAccount(self):
+        return types.SimpleNamespace(id="1", username="alice", title="alice")
+
+    def switchUser(self, user):
+        self.switches.append(user)
+        values = {
+            str(user).casefold(),
+            str(getattr(user, "id", "")).casefold(),
+            str(getattr(user, "username", "")).casefold(),
+            str(getattr(user, "title", "")).casefold(),
+            str(getattr(user, "name", "")).casefold(),
+        }
+        for identity, server in self.user_servers.items():
+            if str(identity).casefold() in values:
+                return server
+        raise KeyError(user)
 
     def sessions(self):
         return list(self._sessions)
@@ -185,7 +206,9 @@ class WatchStateSyncTests(unittest.TestCase):
         self.plugin._watched_percent = 90
         self.plugin._plex_sessions = {}
         self.plugin._plex_user_identity_cache = {}
+        self.plugin._plex_user_servers = {}
         self.plugin._jellyfin_auth_cache = {}
+        self.plugin._get_plex_token_identity = lambda _name: ["alice", "1"]
 
     @staticmethod
     def _state(**overrides):
@@ -253,6 +276,67 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertFalse(state.watched)
         self.assertEqual(state.progress_ms, 35 * 60 * 1000)
 
+    def test_multiuser_resume_reads_state_from_requested_plex_user(self):
+        owner_item = PlexItem(viewOffset=90 * 1000, duration=3600 * 1000)
+        bob_item = PlexItem(viewOffset=240 * 1000, duration=3600 * 1000)
+        bob_plex = FakePlex({"/library/metadata/5033": bob_item})
+        plex = FakePlex(
+            {"/library/metadata/5033": owner_item},
+            user_servers={"bob": bob_plex},
+        )
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+
+        state = self.plugin._build_plex_resume_state(
+            source,
+            "/library/metadata/5033",
+            user_id="7",
+            user_name="bob",
+            fallback_to_token_owner=False,
+        )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.progress_ms, 240 * 1000)
+        self.assertEqual(plex.fetches, ["/library/metadata/5033"])
+        self.assertEqual(bob_plex.fetches, ["/library/metadata/5033"])
+        self.assertTrue(plex.switches)
+
+    def test_multiuser_history_reads_state_from_requested_plex_user(self):
+        owner_item = PlexItem(viewOffset=90 * 1000, duration=3600 * 1000)
+        bob_item = PlexItem(viewOffset=240 * 1000, duration=3600 * 1000)
+        bob_plex = FakePlex({"/library/metadata/5033": bob_item})
+        plex = FakePlex(
+            {"/library/metadata/5033": owner_item},
+            user_servers={"bob": bob_plex},
+        )
+        plex.systemAccount = lambda _account_id: types.SimpleNamespace(title="bob")
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+
+        state = self.plugin._build_plex_history_state(
+            source,
+            {"key": "/library/metadata/5033", "viewedAt": 200, "accountID": "7"},
+        )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.user_name, "bob")
+        self.assertEqual(state.progress_ms, 240 * 1000)
+        self.assertEqual(plex.fetches, ["/library/metadata/5033"])
+        self.assertEqual(bob_plex.fetches, ["/library/metadata/5033"])
+
+    def test_resume_source_event_uses_observation_time(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        item.lastViewedAt = datetime.fromtimestamp(100, tz=timezone.utc)
+        plex = FakePlex({"/library/metadata/5033": item})
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+
+        before = time.time()
+        state = self.plugin._build_plex_resume_state(source, "/library/metadata/5033")
+        after = time.time()
+
+        self.assertIsNotNone(state)
+        self.assertGreaterEqual(state.source_event_at, before)
+        self.assertLessEqual(state.source_event_at, after)
+        self.assertEqual(state.played_at, item.lastViewedAt.isoformat())
+
     def test_episode_keeps_series_and_episode_provider_ids_separate(self):
         episode = PlexItem(
             type="episode",
@@ -282,7 +366,7 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(state.episode_tvdb_id, "episode-222")
 
     def test_websocket_uses_notification_key_and_session_user(self):
-        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        item = PlexItem(viewOffset=30 * 1000, duration=3600 * 1000)
         session = types.SimpleNamespace(
             sessionKey="session-1",
             user=types.SimpleNamespace(id="7", title="bob"),
@@ -303,12 +387,14 @@ class WatchStateSyncTests(unittest.TestCase):
             "key": "/library/metadata/5033",
             "sessionKey": "session-1",
             "state": "playing",
+            "viewOffset": 180 * 1000,
         })
 
         self.assertEqual(plex.fetches, ["/library/metadata/5033"])
         self.assertEqual(len(synced), 1)
         self.assertEqual(synced[0].user_name, "bob")
         self.assertEqual(synced[0].user_id, "7")
+        self.assertEqual(synced[0].progress_ms, 180 * 1000)
 
     def test_websocket_numeric_rating_key_fallback_is_integer(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
@@ -319,6 +405,26 @@ class WatchStateSyncTests(unittest.TestCase):
 
         self.assertIsNotNone(state)
         self.assertEqual(plex.fetches, [5033])
+
+    def test_websocket_stop_ignores_owner_isplayed_with_notification_progress(self):
+        item = PlexItem(viewOffset=30 * 1000, duration=3600 * 1000, isPlayed=True)
+        plex = FakePlex({"/library/metadata/5033": item})
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+
+        state = self.plugin._build_plex_websocket_stopped_state(
+            source,
+            "/library/metadata/5033",
+            account_id="7",
+            user_name="bob",
+            fallback_to_token_owner=False,
+            progress_ms_override=180 * 1000,
+        )
+
+        self.assertIsNotNone(state)
+        self.assertFalse(state.watched)
+        self.assertEqual(state.progress_ms, 180 * 1000)
+        self.assertEqual(plex.fetches, ["/library/metadata/5033"])
+        self.assertEqual(plex.switches, [])
 
     def test_websocket_without_session_user_does_not_guess_token_owner(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
@@ -410,6 +516,41 @@ class WatchStateSyncTests(unittest.TestCase):
         self.plugin._poll_plex_history(source, target)
 
         self.assertEqual(queried, [98])
+
+    def test_history_overlap_processes_unseen_event_before_cursor(self):
+        source = FakeService("plex", "plex", types.SimpleNamespace())
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        history_item = {"viewedAt": 99, "id": "event-99", "accountID": "7"}
+        self.plugin._test_data["plex_history_ts::plex"] = 100
+        self.plugin._get_plex_history = lambda _source, since_ts=0: [history_item]
+        self.plugin._build_plex_history_state = lambda *_args: None
+
+        self.plugin._poll_plex_history(source, target)
+
+        event_id = self.plugin._history_event_id(history_item)
+        self.assertIn(event_id, self.plugin._test_data["plex_history_processed::plex"])
+
+    def test_webhook_source_event_uses_payload_time_not_last_viewed_at(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000, isPlayed=True)
+        item.lastViewedAt = datetime.fromtimestamp(100, tz=timezone.utc)
+        plex = FakePlex({"/library/metadata/5033": item})
+        plex.systemAccount = lambda _account_id: types.SimpleNamespace(title="bob")
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+        event = types.SimpleNamespace(
+            event="media.stop",
+            item_id="/library/metadata/5033",
+            user_name=None,
+            json_object={"AccountID": "7", "viewOffset": 120 * 1000, "timestamp": 200},
+        )
+
+        state = self.plugin._build_plex_state(source, event)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.user_name, "bob")
+        self.assertFalse(state.watched)
+        self.assertEqual(state.progress_ms, 120 * 1000)
+        self.assertEqual(state.source_event_at, 200)
+        self.assertEqual(state.played_at, item.lastViewedAt.isoformat())
 
     def test_episode_matching_reads_with_authenticated_user_context(self):
         old_request_utils = WATCHSTATESYNC.RequestUtils
@@ -529,6 +670,23 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(
             self.plugin._test_data["diagnostics"]["outbox"]["stale_dropped"], 1
         )
+
+    def test_outbox_capacity_keeps_newest_entries(self):
+        entries = [{"key": str(index)} for index in range(501)]
+
+        self.plugin._save_outbox(entries)
+
+        saved = self.plugin._test_data["outbox"]
+        self.assertEqual(len(saved), 500)
+        self.assertEqual(saved[0]["key"], "1")
+        self.assertEqual(saved[-1]["key"], "500")
+
+    def test_mutating_api_endpoints_are_post_only(self):
+        api = {item["path"]: item for item in self.plugin.get_api()}
+
+        self.assertEqual(api["/clear_history"]["methods"], ["POST"])
+        self.assertEqual(api["/sync_now"]["methods"], ["POST"])
+        self.assertEqual(api["/diagnostics"]["methods"], ["GET"])
 
     def test_outbox_progress_never_regresses_target_progress(self):
         state = self._state(progress_ms=120000)
