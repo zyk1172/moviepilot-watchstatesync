@@ -585,18 +585,23 @@ class WatchStateSyncTests(unittest.TestCase):
         target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
         self.plugin._test_data["plex_history_ts::plex"] = 100
         queried = []
-        self.plugin._get_plex_history = lambda _source, since_ts=0: queried.append(since_ts) or []
+        self.plugin._get_plex_history = (
+            lambda _source, since_ts=0, account_id=None:
+            queried.append((since_ts, account_id)) or []
+        )
 
         self.plugin._poll_plex_history(source, target)
 
-        self.assertEqual(queried, [98])
+        self.assertEqual(queried, [(98, None)])
 
     def test_history_overlap_processes_unseen_event_before_cursor(self):
         source = FakeService("plex", "plex", types.SimpleNamespace())
         target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
         history_item = {"viewedAt": 99, "id": "event-99", "accountID": "7"}
         self.plugin._test_data["plex_history_ts::plex"] = 100
-        self.plugin._get_plex_history = lambda _source, since_ts=0: [history_item]
+        self.plugin._get_plex_history = (
+            lambda _source, since_ts=0, account_id=None: [history_item]
+        )
         self.plugin._build_plex_history_state = lambda *_args: None
 
         self.plugin._poll_plex_history(source, target)
@@ -643,6 +648,78 @@ class WatchStateSyncTests(unittest.TestCase):
         processed = self.plugin._test_data["plex_history_processed::plex"]
         self.assertIn(self.plugin._history_event_id(history[0]), processed)
         self.assertIn(self.plugin._history_event_id(history[1]), processed)
+
+    def test_history_defaults_to_token_owner_scope(self):
+        source_plex = FakePlex()
+        source = FakeService("plex", "plex", FakeSourceInstance(source_plex))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._test_data["plex_history_ts::plex"] = 100
+        history = [
+            {
+                "viewedAt": 101,
+                "id": "alice-event",
+                "accountID": "1",
+                "key": "/library/metadata/alice",
+            },
+            {
+                "viewedAt": 102,
+                "id": "bob-event",
+                "accountID": "7",
+                "key": "/library/metadata/bob",
+            },
+        ]
+        queried = []
+        built = []
+        self.plugin._get_plex_history = (
+            lambda _source, since_ts=0, account_id=None:
+            queried.append((since_ts, account_id)) or history
+        )
+        self.plugin._build_plex_history_state = (
+            lambda _source, item: built.append(item) or None
+        )
+
+        self.plugin._poll_plex_history(source, target)
+
+        self.assertEqual(queried, [(98, "1")])
+        self.assertEqual([item["id"] for item in built], ["alice-event"])
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 102)
+
+    def test_unrelated_token_owner_history_failure_cannot_block_cursor(self):
+        source_plex = FakePlex()
+        source = FakeService("plex", "plex", FakeSourceInstance(source_plex))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._test_data["plex_history_ts::plex"] = 100
+        history = [
+            {
+                "viewedAt": 101,
+                "id": "alice-event",
+                "accountID": "1",
+                "key": "/library/metadata/alice",
+            },
+            {
+                "viewedAt": 102,
+                "id": "bob-event",
+                "accountID": "7",
+                "key": "/library/metadata/bob",
+            },
+        ]
+        built = []
+        self.plugin._get_plex_history = (
+            lambda _source, since_ts=0, account_id=None: history
+        )
+
+        def build_state(_source, item):
+            built.append(item["id"])
+            if item["id"] == "bob-event":
+                raise RuntimeError("Bob state must never be built in owner scope")
+            return None
+
+        self.plugin._build_plex_history_state = build_state
+
+        self.plugin._poll_plex_history(source, target)
+
+        self.assertEqual(built, ["alice-event"])
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 102)
 
     def test_history_identity_failure_never_falls_back_to_configured_user(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
@@ -886,6 +963,27 @@ class WatchStateSyncTests(unittest.TestCase):
             self.plugin._test_data["plex_resume_snapshot::plex"],
             {"5033": {"seconds": 120}},
         )
+
+    def test_token_owner_change_updates_scope_and_resets_state(self):
+        source = FakeService("plex", "plex", FakeSourceInstance(FakePlex()))
+        self.plugin._get_service = lambda _name: source
+        self.plugin._get_plex_token_identity = lambda _name: ["bob", "7"]
+        self.plugin._test_data.update({
+            "sync_scope": "plex|account:1",
+            "plex_history_ts::plex": 100,
+            "plex_history_processed::plex": ["alice-event"],
+            "plex_resume_snapshot::plex": {"5033": {"seconds": 120}},
+        })
+
+        self.plugin.init_plugin({
+            "server_a": "plex",
+            "server_b": "jellyfin",
+        })
+
+        self.assertEqual(self.plugin._test_data["sync_scope"], "plex|account:7")
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 0)
+        self.assertEqual(self.plugin._test_data["plex_history_processed::plex"], [])
+        self.assertEqual(self.plugin._test_data["plex_resume_snapshot::plex"], {})
 
     def test_source_event_identity_normalizes_user_name_case(self):
         upper = self._state(user_name="Bob")

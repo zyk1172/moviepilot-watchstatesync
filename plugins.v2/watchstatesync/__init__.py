@@ -818,7 +818,7 @@ class WatchStateSync(_PluginBase):
 
     def _get_plex_resume_items(self, source_service: ServiceInfo, num: int = 50) -> List[Any]:
         """读取单一配置源用户的 Continue Watching，避免只使用 token owner。"""
-        source_user_id, source_user_name = self._plex_source_user_fields()
+        source_user_id, source_user_name = self._effective_source_user_fields(source_service)
         if not source_user_id and not source_user_name:
             return source_service.instance.get_resume(num=num) or []
 
@@ -858,7 +858,7 @@ class WatchStateSync(_PluginBase):
         raw_snapshot = self.get_data(snapshot_key) or {}
         last_snapshot = {str(key): value for key, value in raw_snapshot.items()}
         current_snapshot: Dict[str, Dict[str, Any]] = {}
-        source_user_id, source_user_name = self._plex_source_user_fields()
+        source_user_id, source_user_name = self._effective_source_user_fields(source_service)
 
         for resume in resume_items:
             item_id = (
@@ -1072,7 +1072,7 @@ class WatchStateSync(_PluginBase):
         else:
             # 只有明确经过 source accountID 查询的记录才可能没有用户字段；
             # 轮询入口会在此之前做 scope 过滤。无配置时继续保持 token owner 兼容。
-            requested_user_id, requested_user_name = self._plex_source_user_fields()
+            requested_user_id, requested_user_name = self._effective_source_user_fields(source_service)
             if requested_user_id or requested_user_name:
                 user_id, user_name = self._plex_user_fields(
                     plex, requested_user_id, requested_user_name
@@ -1152,7 +1152,7 @@ class WatchStateSync(_PluginBase):
         requested_user_id = user_id
         requested_user_name = user_name
         if not requested_user_id and not requested_user_name and fallback_to_token_owner:
-            requested_user_id, requested_user_name = self._plex_source_user_fields()
+            requested_user_id, requested_user_name = self._effective_source_user_fields(source_service)
         if requested_user_id or requested_user_name:
             resolved_user_id, resolved_user_name = self._plex_user_fields(
                 plex, requested_user_id, requested_user_name
@@ -1242,7 +1242,7 @@ class WatchStateSync(_PluginBase):
         requested_user_id = account_id
         requested_user_name = user_name
         if not requested_user_id and not requested_user_name and fallback_to_token_owner:
-            requested_user_id, requested_user_name = self._plex_source_user_fields()
+            requested_user_id, requested_user_name = self._effective_source_user_fields(source_service)
         if requested_user_id or requested_user_name:
             resolved_user_id, resolved_user_name = self._plex_user_fields(
                 plex, requested_user_id, requested_user_name
@@ -2259,12 +2259,7 @@ class WatchStateSync(_PluginBase):
         }
 
     def _sync_scope_value(self) -> str:
-        source_user = self._configured_source_user()
-        source_marker = (
-            str(source_user).strip().casefold()
-            if source_user
-            else "__token_owner__"
-        )
+        source_marker = self._effective_source_scope_marker()
         server_marker = str(self._server_a or "").strip().casefold()
         return f"{server_marker}|{source_marker}"
 
@@ -2327,20 +2322,35 @@ class WatchStateSync(_PluginBase):
             return source_user, None
         return None, source_user
 
-    def _plex_source_account_id(self, source_service: ServiceInfo) -> Optional[str]:
-        """尽量将配置的 Plex 用户名解析为 PMS 本地 accountID。"""
+    def _plex_source_account_id(self, source_service: Optional[ServiceInfo] = None) -> Optional[str]:
+        """解析显式源用户或 token owner 对应的 PMS 本地 accountID。"""
         source_user = self._configured_source_user()
-        if not source_user:
-            return None
-        source_user = str(source_user).strip()
-        if source_user.isdigit():
-            return source_user
+        if source_user:
+            source_user = str(source_user).strip()
+            if source_user.isdigit():
+                return source_user
 
-        try:
-            plex = source_service.instance.get_plex()
-        except Exception:
+        source_server = source_service.name if source_service else self._server_a
+        owner_identities = set()
+        if not source_user and source_server:
+            owner_identities = {
+                value.casefold()
+                for value in self._get_plex_token_identity(source_server)
+                if value
+            }
+
+        plex = None
+        if source_service:
+            try:
+                plex = source_service.instance.get_plex()
+            except Exception:
+                plex = None
+        if not plex:
+            # myPlexAccount 的 id 不一定是 PMS 本地 accountID；没有
+            # systemAccounts 上下文时只能退回用户名/原始 identity 过滤。
             return None
-        wanted = source_user.casefold()
+
+        wanted = str(source_user).casefold() if source_user else None
 
         def field(account: Any, name: str) -> Any:
             if isinstance(account, dict):
@@ -2354,16 +2364,24 @@ class WatchStateSync(_PluginBase):
                 or field(account, "accountId")
             )
 
-        def matches(account: Any) -> bool:
-            return any(
-                value and self._coerce_str(value).casefold() == wanted
-                for value in (
-                    field(account, "title"),
-                    field(account, "username"),
-                    field(account, "name"),
-                    field(account, "email"),
-                )
-                if self._coerce_str(value)
+        def identities(account: Any) -> set:
+            result = set()
+            for raw_value in (
+                field(account, "title"),
+                field(account, "username"),
+                field(account, "name"),
+                field(account, "email"),
+            ):
+                value = self._coerce_str(raw_value)
+                if value:
+                    result.add(value.casefold())
+            return result
+
+        def matches(account: Any, expected: set) -> bool:
+            account_id_value = account_id(account)
+            return bool(
+                (account_id_value and account_id_value.casefold() in expected)
+                or identities(account).intersection(expected)
             )
 
         system_accounts = getattr(plex, "systemAccounts", None)
@@ -2373,24 +2391,54 @@ class WatchStateSync(_PluginBase):
                 if isinstance(accounts, dict):
                     accounts = accounts.values()
                 for account in accounts:
-                    if matches(account):
+                    expected = {wanted} if wanted else owner_identities
+                    if matches(account, expected):
                         resolved = account_id(account)
                         if resolved:
                             return resolved
             except Exception:
                 pass
 
-        # 某些 PlexAPI 版本只暴露 myPlexAccount；仅在返回的对象本身就是
-        # 配置用户时使用其 id，避免把 owner 的 id 猜给其他用户。
-        account_method = getattr(plex, "myPlexAccount", None)
-        if callable(account_method):
-            try:
-                account = account_method()
-                if matches(account):
-                    return account_id(account)
-            except Exception:
-                pass
         return None
+
+    def _effective_source_user_fields(
+        self, source_service: ServiceInfo
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """返回显式源用户，或当前 Plex token owner 的用户上下文。"""
+        configured_fields = self._plex_source_user_fields()
+        if configured_fields[0] or configured_fields[1]:
+            return configured_fields
+
+        owner_id = self._plex_source_account_id(source_service)
+        if owner_id:
+            try:
+                plex = source_service.instance.get_plex()
+                return self._plex_user_fields(plex, owner_id)
+            except Exception:
+                return owner_id, None
+
+        for identity in self._get_plex_token_identity(source_service.name):
+            if identity and not identity.isdigit() and "@" not in identity:
+                return None, identity
+        return None, None
+
+    def _effective_source_scope_marker(self) -> str:
+        configured = self._configured_source_user()
+        if configured:
+            return str(configured).strip().casefold()
+
+        source_service = self._get_service(self._server_a) if self._server_a else None
+        owner_id = self._plex_source_account_id(source_service)
+        if owner_id:
+            return f"account:{owner_id.casefold()}"
+        if self._server_a:
+            for identity in self._get_plex_token_identity(self._server_a):
+                if identity and not identity.isdigit() and "@" not in identity:
+                    return f"user:{identity.casefold()}"
+            for identity in self._get_plex_token_identity(self._server_a):
+                if identity and identity.isdigit():
+                    return f"identity:{identity}"
+        return "__token_owner__"
 
     def _history_item_matches_source_user(
         self,
@@ -2402,26 +2450,47 @@ class WatchStateSync(_PluginBase):
         if self._source_user_invalid:
             return False
         configured = self._configured_source_user()
-        if not configured:
-            return True
 
         raw_user_id, raw_user_name = self._history_user_fields(history_item)
         if source_account_id:
             # accountID 查询是服务端 scope；返回记录若带 ID，仍必须校验，
             # 防止 Plex 接口或代理错误地混入其他用户的 history。
-            return not raw_user_id or raw_user_id == source_account_id
+            if raw_user_id:
+                return raw_user_id == source_account_id
+            if not raw_user_name:
+                return True
         if not raw_user_id and not raw_user_name:
-            # 没有服务端 scope 且没有原始身份时，不能安全归因给配置用户。
+            # 没有服务端 scope 且没有原始身份时，不能安全归因给任何用户。
             return False
 
-        plex = source_service.instance.get_plex()
+        try:
+            plex = source_service.instance.get_plex()
+        except Exception:
+            return False
         resolved_user_id, resolved_user_name = self._plex_user_fields(
             plex, raw_user_id, raw_user_name
         )
-        wanted = str(configured).casefold()
+        wanted = (
+            {str(configured).casefold()}
+            if configured
+            else {
+                value.casefold()
+                for value in self._get_plex_token_identity(source_service.name)
+                if value
+            }
+        )
+        if not wanted:
+            return False
+        if raw_user_id:
+            # accountID 存在时优先相信 ID；若无法把它映射到当前 scope，
+            # 不用同一条记录里可能不一致的显示名强行放行。
+            return any(
+                value and value.casefold() in wanted
+                for value in (raw_user_id, resolved_user_id)
+            )
         return any(
-            value and value.casefold() == wanted
-            for value in (raw_user_id, raw_user_name, resolved_user_id, resolved_user_name)
+            value and value.casefold() in wanted
+            for value in (raw_user_name, resolved_user_name)
         )
 
     def _user_allowed(self, state: NormalizedState) -> bool:
