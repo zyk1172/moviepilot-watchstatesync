@@ -19,18 +19,18 @@
   - 播放历史
   - Continue Watching
 - Plex 本地 WebSocket 仅作为低延迟加速层；定时轮询始终保留为 reconciliation，监听断线时会在轮询周期检查并重连
-- 支持清除插件历史数据和 Plex 轮询游标
+- 通过 Bearer 认证 API 支持清除插件历史数据、Plex 轮询游标和手动轮询
 - Jellyfin 继续观看写回支持用户名/密码登录换取用户 token
 - Jellyfin 读取、匹配、写回和写后验证共用同一个 Jellyfin 用户上下文
 - Plex history 使用分页和游标，失败事件进入 Outbox 重试
-- 插件页提供最近轮询、匹配、写回和验证诊断，并支持立即轮询一次
+- 插件页提供最近轮询、匹配、写回和验证诊断；手动操作只通过受保护 API 提供
 - Pull Request 会由 GitHub Actions 自动运行仓库内回归测试
 
 ## 当前限制
 
 - 依赖 MoviePilot 先正确配置好 Plex 和 Jellyfin 媒体服务器
-- 更适合单用户场景
-- 多用户 Plex 请填写“允许同步的用户名或 Plex accountId”；WebSocket 会通过 `sessionKey` 查询当前播放用户并优先使用通知中的用户进度，History/轮询在 PlexAPI 支持 `switchUser()` 时切换到该用户读取状态；无法切换时会跳过，避免误读 token owner 的状态
+- 同步模型固定为一个 Plex 源用户到一个 Jellyfin 登录用户，不提供多个 Plex 用户映射到同一个 Jellyfin 用户
+- “Plex 源用户”留空时使用 Plex token owner；填写一个用户名或 accountId 时，轮询、History 和 WebSocket 会使用该用户上下文，无法切换时跳过，避免误读 token owner 的状态
 - 不做历史全量回填
 - 媒体匹配仍依赖 Plex/Jellyfin 两边刮削结果尽量一致
 - 双向同步已从仓库定位中移除
@@ -45,8 +45,8 @@
    - `Jellyfin 目标服务器`
 5. 保持 Plex 轮询开启作为稳定兜底；即使启用 WebSocket，轮询也会继续执行 reconciliation。
 6. 如果开启 `同步继续观看进度`，必须填写 Jellyfin 用户名和密码。该身份用于目标状态读取、匹配、写回和写后验证；不要让 MoviePilot 媒体服务器用户与插件登录用户不一致。
-7. 如有多个 Plex 用户，填写：
-   - `允许同步的用户名或 Plex accountId`
+7. 如需指定非 token owner 的 Plex 用户，填写一个：
+   - `Plex 源用户（用户名或 accountId）`
 
 ## 推荐配置
 
@@ -62,4 +62,5 @@
 - Jellyfin 继续观看必须使用用户登录态 token；仅 API Key 不会执行进度写回
 - 每次写回后都会重新读取 Jellyfin UserData；验证失败会重试一次并保留 Outbox
 - Outbox 保存源事件时间和序列号；同一媒体用户只保留最新待处理状态，检测到目标已有更高进度时会丢弃旧重试，避免进度倒退
+- `sync_now`、`clear_history` 和 `diagnostics` API 均要求 Bearer 认证；当前 V2 Vuetify 页面不提交未认证的原生表单
 - 当前插件实现仍是 MoviePilot V2（`package.v2.json` / `plugins.v2`），不包含 V3 实现

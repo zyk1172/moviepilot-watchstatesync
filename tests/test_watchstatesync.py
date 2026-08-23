@@ -121,16 +121,22 @@ class PlexItem:
 
 
 class FakePlex:
-    def __init__(self, items=None, sessions=None, user_servers=None):
+    def __init__(self, items=None, sessions=None, user_servers=None, continue_items=None):
         self.items = items or {}
         self.fetches = []
         self._sessions = sessions or []
         self.user_servers = user_servers or {}
+        self.continue_items = continue_items or []
+        self.fetch_items_calls = []
         self.switches = []
 
     def fetchItem(self, key):
         self.fetches.append(key)
         return self.items[key]
+
+    def fetchItems(self, *args, **kwargs):
+        self.fetch_items_calls.append((args, kwargs))
+        return list(self.continue_items)
 
     def systemAccount(self, account_id):
         return types.SimpleNamespace(id=account_id, title="alice")
@@ -157,11 +163,21 @@ class FakePlex:
 
 
 class FakeSourceInstance:
-    def __init__(self, plex):
+    def __init__(self, plex, resume_items=None, libraries=None):
         self._plex = plex
+        self.resume_items = resume_items or []
+        self.libraries = libraries or []
+        self.resume_calls = []
 
     def get_plex(self):
         return self._plex
+
+    def get_resume(self, num=12):
+        self.resume_calls.append(num)
+        return list(self.resume_items)[:num]
+
+    def get_librarys(self, hidden=False):
+        return list(self.libraries)
 
 
 class FakeService:
@@ -208,6 +224,8 @@ class WatchStateSyncTests(unittest.TestCase):
         self.plugin._plex_user_identity_cache = {}
         self.plugin._plex_user_servers = {}
         self.plugin._jellyfin_auth_cache = {}
+        self.plugin._source_user = None
+        self.plugin._source_user_invalid = False
         self.plugin._get_plex_token_identity = lambda _name: ["alice", "1"]
 
     @staticmethod
@@ -321,6 +339,55 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(state.progress_ms, 240 * 1000)
         self.assertEqual(plex.fetches, ["/library/metadata/5033"])
         self.assertEqual(bob_plex.fetches, ["/library/metadata/5033"])
+
+    def test_poll_resume_uses_configured_user_continue_watching_feed(self):
+        owner_item = PlexItem(viewOffset=90 * 1000, duration=3600 * 1000)
+        bob_item = PlexItem(viewOffset=240 * 1000, duration=3600 * 1000)
+        resume_item = types.SimpleNamespace(ratingKey="/library/metadata/5033")
+        bob_plex = FakePlex(
+            {"/library/metadata/5033": bob_item},
+            continue_items=[resume_item],
+        )
+        plex = FakePlex({"/library/metadata/5033": owner_item}, user_servers={"bob": bob_plex})
+        source_instance = FakeSourceInstance(
+            plex,
+            resume_items=[types.SimpleNamespace(id="owner-item")],
+            libraries=[types.SimpleNamespace(id=1)],
+        )
+        source = FakeService("plex", "plex", source_instance)
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._source_user = "bob"
+        self.plugin._allowed_users = ["bob"]
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1]) or "success"
+
+        self.plugin._poll_plex_resume(source, target)
+
+        self.assertEqual(source_instance.resume_calls, [])
+        self.assertEqual(len(plex.fetch_items_calls), 0)
+        self.assertEqual(len(bob_plex.fetch_items_calls), 1)
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0].user_name, "bob")
+        self.assertEqual(synced[0].progress_ms, 240 * 1000)
+
+    def test_poll_resume_keeps_token_owner_compatibility_when_source_user_is_empty(self):
+        item = PlexItem(viewOffset=240 * 1000, duration=3600 * 1000)
+        plex = FakePlex({"/library/metadata/5033": item})
+        source_instance = FakeSourceInstance(
+            plex,
+            resume_items=[types.SimpleNamespace(id="/library/metadata/5033")],
+        )
+        source = FakeService("plex", "plex", source_instance)
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1]) or "success"
+
+        self.plugin._poll_plex_resume(source, target)
+
+        self.assertEqual(source_instance.resume_calls, [50])
+        self.assertEqual(plex.fetch_items_calls, [])
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0].user_name, "alice")
 
     def test_resume_source_event_uses_observation_time(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
@@ -687,6 +754,30 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(api["/clear_history"]["methods"], ["POST"])
         self.assertEqual(api["/sync_now"]["methods"], ["POST"])
         self.assertEqual(api["/diagnostics"]["methods"], ["GET"])
+        for item in api.values():
+            self.assertEqual(item["auth"], "bear")
+        page = repr(self.plugin.get_page())
+        self.assertNotIn('"action":', page)
+        self.assertNotIn('"method": "POST"', page)
+
+    def test_source_user_config_accepts_only_one_legacy_value(self):
+        self.plugin.init_plugin({"allowed_users": "alice,bob"})
+        self.assertTrue(self.plugin._source_user_invalid)
+        self.assertFalse(self.plugin._user_allowed(self._state(user_name="alice")))
+
+        self.plugin.init_plugin({"allowed_users": "Bob"})
+        self.assertFalse(self.plugin._source_user_invalid)
+        self.assertEqual(self.plugin._plex_source_user_fields(), (None, "Bob"))
+        self.assertTrue(self.plugin._user_allowed(self._state(user_name="bob")))
+
+    def test_source_event_identity_normalizes_user_name_case(self):
+        upper = self._state(user_name="Bob")
+        lower = self._state(user_name="bob")
+
+        self.assertEqual(
+            self.plugin._source_event_identity(upper),
+            self.plugin._source_event_identity(lower),
+        )
 
     def test_outbox_progress_never_regresses_target_progress(self):
         state = self._state(progress_ms=120000)

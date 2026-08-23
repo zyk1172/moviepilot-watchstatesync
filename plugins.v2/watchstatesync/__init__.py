@@ -71,6 +71,8 @@ class WatchStateSync(_PluginBase):
     _enabled = False
     _server_a = ""
     _server_b = ""
+    _source_user: Optional[str] = None
+    _source_user_invalid = False
     _allowed_users: List[str] = []
     _sync_watched = True
     _sync_progress = True
@@ -131,9 +133,18 @@ class WatchStateSync(_PluginBase):
         self._use_websocket = bool(config.get("use_websocket", True))
         self._jellyfin_username = (config.get("jellyfin_username") or "").strip()
         self._jellyfin_password = config.get("jellyfin_password") or ""
-        self._allowed_users = [
+        configured_users = [
             user.strip() for user in (config.get("allowed_users") or "").split(",") if user.strip()
         ]
+        self._source_user_invalid = len(configured_users) > 1
+        self._source_user = configured_users[0] if len(configured_users) == 1 else None
+        self._allowed_users = [self._source_user] if self._source_user else []
+        if self._source_user_invalid:
+            self._enabled = False
+            logger.error(
+                "观看进度同步：当前版本只支持一个 Plex 源用户，"
+                "请在‘允许同步的用户名或 Plex accountId’中只填写一个值；已暂停同步写回"
+            )
         self._cleanup_caches()
         if self._enabled and self._use_websocket and self._has_plex_source():
             self._start_plex_alert_listener()
@@ -150,18 +161,21 @@ class WatchStateSync(_PluginBase):
             "path": "/clear_history",
             "endpoint": self.clear_history,
             "methods": ["POST"],
+            "auth": "bear",
             "summary": "清除插件历史数据",
             "description": "清空同步记录、Outbox，并重置 Plex 轮询历史游标与继续观看快照。"
         }, {
             "path": "/sync_now",
             "endpoint": self.sync_now,
             "methods": ["POST"],
+            "auth": "bear",
             "summary": "立即轮询 Plex",
             "description": "立即执行一次 Plex history、Continue Watching 和失败重试。"
         }, {
             "path": "/diagnostics",
             "endpoint": self.get_diagnostics,
             "methods": ["GET"],
+            "auth": "bear",
             "summary": "查看同步诊断",
             "description": "返回最近轮询、匹配、写回和验证状态。"
         }]
@@ -315,9 +329,9 @@ class WatchStateSync(_PluginBase):
                                     "component": "VTextarea",
                                     "props": {
                                         "model": "allowed_users",
-                                        "label": "允许同步的用户名或 Plex accountId（逗号分隔，可留空）",
-                                        "rows": 2,
-                                        "placeholder": "alice,bob"
+                                        "label": "Plex 源用户（用户名或 accountId，最多一个，可留空）",
+                                        "rows": 1,
+                                        "placeholder": "bob 或 7"
                                     }
                                 }]
                             }
@@ -519,22 +533,13 @@ class WatchStateSync(_PluginBase):
                     {"component": "VCardTitle", "text": "运行诊断"},
                     {"component": "VCardText", "text": diagnostic_text},
                     {
-                        "component": "VCardActions",
-                        "content": [{
-                            "component": "VForm",
-                            "props": {
-                                "action": "/api/v1/plugin/WatchStateSync/sync_now",
-                                "method": "POST"
-                            },
-                            "content": [{
-                                "component": "VBtn",
-                                "props": {
-                                    "type": "submit",
-                                    "variant": "tonal",
-                                    "text": "立即同步一次"
-                                }
-                            }]
-                        }]
+                        "component": "VAlert",
+                        "props": {
+                            "class": "mt-3",
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "立即同步和清除历史属于受保护操作，请通过宿主的 Bearer 认证 API 客户端调用。"
+                        }
                     }
                 ]
             },
@@ -555,21 +560,13 @@ class WatchStateSync(_PluginBase):
                                 }
                             },
                             {
-                                "component": "VForm",
+                                "component": "VAlert",
                                 "props": {
-                                    "action": "/api/v1/plugin/WatchStateSync/clear_history",
-                                    "method": "POST",
+                                    "type": "info",
+                                    "variant": "tonal",
                                     "class": "mt-3"
                                 },
-                                "content": [{
-                                    "component": "VBtn",
-                                    "props": {
-                                        "type": "submit",
-                                        "color": "error",
-                                        "variant": "tonal",
-                                        "text": "清除历史数据"
-                                    }
-                                }]
+                                "text": "清除历史属于受保护操作，请通过 Bearer 认证 API 客户端调用 POST /api/v1/plugin/WatchStateSync/clear_history。"
                             }
                         ]
                     }
@@ -801,19 +798,65 @@ class WatchStateSync(_PluginBase):
         if all_ok and max_seen > last_seen:
             self.save_data(state_key, max_seen)
 
+    def _get_plex_resume_items(self, source_service: ServiceInfo, num: int = 50) -> List[Any]:
+        """读取单一配置源用户的 Continue Watching，避免只使用 token owner。"""
+        source_user_id, source_user_name = self._plex_source_user_fields()
+        if not source_user_id and not source_user_name:
+            return source_service.instance.get_resume(num=num) or []
+
+        plex = source_service.instance.get_plex()
+        state_plex = self._get_plex_user_server(
+            source_service, plex, source_user_id, source_user_name
+        )
+        if state_plex is None:
+            return []
+        if state_plex is plex:
+            return source_service.instance.get_resume(num=num) or []
+
+        get_libraries = getattr(source_service.instance, "get_librarys", None)
+        if not callable(get_libraries):
+            raise RuntimeError("MoviePilot Plex 服务不支持按用户读取 Continue Watching")
+        libraries = get_libraries(hidden=True)
+        if libraries is None:
+            return []
+        allow_library = ",".join(
+            str(getattr(library, "id"))
+            for library in libraries
+            if getattr(library, "id", None) is not None
+        )
+        items = state_plex.fetchItems(
+            "/hubs/continueWatching/items",
+            container_start=0,
+            container_size=num,
+            maxresults=num,
+            params={"contentDirectoryID": allow_library},
+        )
+        return list(items or [])[:num]
+
     def _poll_plex_resume(self, source_service: ServiceInfo, target_service: ServiceInfo):
-        resume_items = source_service.instance.get_resume(num=50) or []
+        resume_items = self._get_plex_resume_items(source_service, num=50)
         self._record_diagnostic("plex_resume", ok=True, read=len(resume_items))
         snapshot_key = f"plex_resume_snapshot::{source_service.name}"
         raw_snapshot = self.get_data(snapshot_key) or {}
         last_snapshot = {str(key): value for key, value in raw_snapshot.items()}
         current_snapshot: Dict[str, Dict[str, Any]] = {}
+        source_user_id, source_user_name = self._plex_source_user_fields()
 
         for resume in resume_items:
-            item_id = getattr(resume, "id", None) or getattr(resume, "ratingKey", None)
+            item_id = (
+                getattr(resume, "id", None)
+                or getattr(resume, "ratingKey", None)
+                or getattr(resume, "key", None)
+            )
             if not item_id:
                 continue
-            state = self._build_plex_resume_state(source_service, item_id)
+            state = self._build_plex_resume_state(
+                source_service,
+                item_id,
+                source_user_id,
+                source_user_name,
+                not (source_user_id or source_user_name),
+            )
             if not state:
                 continue
             if not self._user_allowed(state):
@@ -1057,11 +1100,20 @@ class WatchStateSync(_PluginBase):
             logger.error(f"观看进度同步：读取 Plex 继续观看条目失败 {err}")
             return None
 
-        resolved_user_id, resolved_user_name = self._plex_user_fields(
-            plex,
-            user_id or getattr(item, "accountID", None),
-            user_name or getattr(item, "userName", None) or getattr(item, "username", None)
-        )
+        requested_user_id = user_id
+        requested_user_name = user_name
+        if not requested_user_id and not requested_user_name and fallback_to_token_owner:
+            requested_user_id, requested_user_name = self._plex_source_user_fields()
+        if requested_user_id or requested_user_name:
+            resolved_user_id, resolved_user_name = self._plex_user_fields(
+                plex, requested_user_id, requested_user_name
+            )
+        else:
+            resolved_user_id, resolved_user_name = self._plex_user_fields(
+                plex,
+                getattr(item, "accountID", None),
+                getattr(item, "userName", None) or getattr(item, "username", None)
+            )
         resolved_user_name = resolved_user_name or (
             self._plex_default_user_name(source_service.name) if fallback_to_token_owner else None
         )
@@ -1138,11 +1190,20 @@ class WatchStateSync(_PluginBase):
             logger.error(f"观看进度同步：读取 Plex WebSocket 停止条目失败 {err}")
             return None
 
-        resolved_user_id, resolved_user_name = self._plex_user_fields(
-            plex,
-            account_id or getattr(item, "accountID", None),
-            user_name or getattr(item, "userName", None) or getattr(item, "username", None)
-        )
+        requested_user_id = account_id
+        requested_user_name = user_name
+        if not requested_user_id and not requested_user_name and fallback_to_token_owner:
+            requested_user_id, requested_user_name = self._plex_source_user_fields()
+        if requested_user_id or requested_user_name:
+            resolved_user_id, resolved_user_name = self._plex_user_fields(
+                plex, requested_user_id, requested_user_name
+            )
+        else:
+            resolved_user_id, resolved_user_name = self._plex_user_fields(
+                plex,
+                getattr(item, "accountID", None),
+                getattr(item, "userName", None) or getattr(item, "username", None)
+            )
         resolved_user_name = resolved_user_name or (
             self._plex_default_user_name(source_service.name) if fallback_to_token_owner else None
         )
@@ -1353,6 +1414,9 @@ class WatchStateSync(_PluginBase):
         return identities
 
     def _plex_default_user_name(self, source_server: str) -> Optional[str]:
+        configured = self._configured_source_user()
+        if configured and not configured.isdigit():
+            return configured
         for identity in self._get_plex_token_identity(source_server):
             if not identity.isdigit() and "@" not in identity:
                 return identity
@@ -2145,18 +2209,42 @@ class WatchStateSync(_PluginBase):
             "progress_ms": int(self._safe_int(user_data.get("PlaybackPositionTicks"), 0) / 10000)
         }
 
+    def _configured_source_user(self) -> Optional[str]:
+        if self._source_user:
+            return self._source_user
+        # 保留旧测试/旧运行态直接设置 _allowed_users 的兼容性，但不再接受多个值。
+        if len(self._allowed_users) == 1:
+            return self._allowed_users[0]
+        return None
+
+    def _plex_source_user_fields(self) -> Tuple[Optional[str], Optional[str]]:
+        source_user = self._configured_source_user()
+        if not source_user:
+            return None, None
+        source_user = source_user.strip()
+        if source_user.isdigit():
+            return source_user, None
+        return None, source_user
+
     def _user_allowed(self, state: NormalizedState) -> bool:
-        configured = {item.casefold() for item in self._allowed_users}
+        if self._source_user_invalid:
+            return False
+
+        configured = self._configured_source_user()
         if configured:
+            configured = configured.casefold()
             return any(
-                value and value.casefold() in configured
+                value and value.casefold() == configured
                 for value in (state.user_name, state.user_id)
             )
 
-        # 未配置显式列表时，轮询优先限制为 Plex token 所属账户；
-        # 如果 Plex token 无法返回账户身份，则保留兼容行为，但在日志中提示风险。
+        # 未配置时固定为 Plex token owner；如果事件没有用户字段，视为已在
+        # owner 上下文中读取。无法取得 token 身份但事件带有用户时宁可跳过，
+        # 避免把未知用户状态写入唯一的 Jellyfin 目标用户。
         identities = self._get_plex_token_identity(state.source_server)
-        if not identities or not (state.user_name or state.user_id):
+        if not identities:
+            return not (state.user_name or state.user_id)
+        if not (state.user_name or state.user_id):
             return True
         identity_set = {item.casefold() for item in identities}
         return any(
@@ -2432,7 +2520,7 @@ class WatchStateSync(_PluginBase):
             ])
         # 优先使用可读用户名，让 history 的 accountID+名称与 WebSocket
         # session 的用户对象能够落到同一个身份；没有名称时再退回 ID。
-        user = state.user_name or state.user_id or ""
+        user = (state.user_name or state.user_id or "").casefold()
         return "|".join([state.source_server or "", item_id, user])
 
     @staticmethod
