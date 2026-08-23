@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -118,14 +119,20 @@ class PlexItem:
 
 
 class FakePlex:
-    def __init__(self, items=None):
+    def __init__(self, items=None, sessions=None):
         self.items = items or {}
+        self.fetches = []
+        self._sessions = sessions or []
 
     def fetchItem(self, key):
+        self.fetches.append(key)
         return self.items[key]
 
     def systemAccount(self, account_id):
         return types.SimpleNamespace(id=account_id, title="alice")
+
+    def sessions(self):
+        return list(self._sessions)
 
 
 class FakeSourceInstance:
@@ -176,6 +183,40 @@ class WatchStateSyncTests(unittest.TestCase):
         self.plugin._sync_progress = True
         self.plugin._min_progress_seconds = 60
         self.plugin._watched_percent = 90
+        self.plugin._plex_sessions = {}
+        self.plugin._plex_user_identity_cache = {}
+        self.plugin._jellyfin_auth_cache = {}
+
+    @staticmethod
+    def _state(**overrides):
+        values = {
+            "source_server": "plex",
+            "source_type": "plex",
+            "event_type": "poll.resume",
+            "user_name": "alice",
+            "media_kind": "movie",
+            "title": "Movie",
+            "original_title": None,
+            "series_title": None,
+            "year": 2024,
+            "tmdb_id": 10,
+            "imdb_id": None,
+            "tvdb_id": None,
+            "season": None,
+            "episode": None,
+            "source_item_id": "5033",
+            "progress_ms": 120000,
+            "duration_ms": 3600000,
+            "watched": False,
+            "percent": 3.33,
+            "played_at": None,
+            "user_id": "7",
+            "operation": WATCHSTATESYNC.StateOperation.PROGRESS,
+            "source_event_at": 100.0,
+            "source_sequence": 1,
+        }
+        values.update(overrides)
+        return WATCHSTATESYNC.NormalizedState(**values)
 
     def test_unscrobble_is_explicit_unwatched_operation(self):
         item = PlexItem(viewOffset=0, duration=1000 * 1000, isPlayed=False, guids=["tmdb://10"])
@@ -240,6 +281,95 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(state.series_tvdb_id, "show-111")
         self.assertEqual(state.episode_tvdb_id, "episode-222")
 
+    def test_websocket_uses_notification_key_and_session_user(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        session = types.SimpleNamespace(
+            sessionKey="session-1",
+            user=types.SimpleNamespace(id="7", title="bob"),
+        )
+        plex = FakePlex({"/library/metadata/5033": item}, sessions=[session])
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._enabled = True
+        self.plugin._server_a = "plex"
+        self.plugin._server_b = "jellyfin"
+        self.plugin._allowed_users = ["bob"]
+        self.plugin._get_service = lambda name: source if name == "plex" else target
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1]) or "success"
+
+        self.plugin._handle_plex_alert_notification({
+            "ratingKey": "5033",
+            "key": "/library/metadata/5033",
+            "sessionKey": "session-1",
+            "state": "playing",
+        })
+
+        self.assertEqual(plex.fetches, ["/library/metadata/5033"])
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0].user_name, "bob")
+        self.assertEqual(synced[0].user_id, "7")
+
+    def test_websocket_numeric_rating_key_fallback_is_integer(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        plex = FakePlex({5033: item})
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+
+        state = self.plugin._build_plex_resume_state(source, "5033")
+
+        self.assertIsNotNone(state)
+        self.assertEqual(plex.fetches, [5033])
+
+    def test_websocket_without_session_user_does_not_guess_token_owner(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        plex = FakePlex({"/library/metadata/5033": item}, sessions=[])
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._enabled = True
+        self.plugin._server_a = "plex"
+        self.plugin._server_b = "jellyfin"
+        self.plugin._get_service = lambda name: source if name == "plex" else target
+        self.plugin._get_plex_token_identity = lambda _name: ["alice"]
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1]) or "success"
+
+        self.plugin._handle_plex_alert_notification({
+            "ratingKey": "5033",
+            "key": "/library/metadata/5033",
+            "sessionKey": "session-1",
+            "state": "playing",
+        })
+
+        self.assertEqual(synced, [])
+        self.assertEqual(plex.fetches, [])
+
+    def test_websocket_keeps_polling_reconciliation_enabled(self):
+        source = FakeService("plex", "plex", FakeSourceInstance(FakePlex()))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._enabled = True
+        self.plugin._server_a = "plex"
+        self.plugin._server_b = "jellyfin"
+        self.plugin._poll_plex = False
+        self.plugin._use_websocket = True
+        self.plugin._get_service = lambda name: source if name == "plex" else target
+        calls = []
+        self.plugin._ensure_plex_alert_listener = lambda _service: calls.append("listener")
+        self.plugin._poll_single_plex_source = lambda *_args: calls.append("poll")
+        self.plugin._reconcile_plex_sessions = lambda *_args: calls.append("reconcile")
+        self.plugin._process_outbox = lambda *_args: calls.append("outbox")
+
+        self.plugin._poll_plex_sources_locked()
+
+        self.assertIn("listener", calls)
+        self.assertIn("poll", calls)
+
+    def test_dead_alert_listener_is_detected(self):
+        dead = types.SimpleNamespace(is_alive=lambda: False)
+        alive = types.SimpleNamespace(is_alive=lambda: True)
+
+        self.assertFalse(WATCHSTATESYNC.WatchStateSync._plex_alert_listener_is_alive(dead))
+        self.assertTrue(WATCHSTATESYNC.WatchStateSync._plex_alert_listener_is_alive(alive))
+
     def test_history_uses_plex_paging_headers(self):
         old_request_utils = WATCHSTATESYNC.RequestUtils
         try:
@@ -270,6 +400,17 @@ class WatchStateSyncTests(unittest.TestCase):
         finally:
             WATCHSTATESYNC.RequestUtils = old_request_utils
 
+    def test_history_cursor_queries_with_overlap_window(self):
+        source = FakeService("plex", "plex", types.SimpleNamespace())
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._test_data["plex_history_ts::plex"] = 100
+        queried = []
+        self.plugin._get_plex_history = lambda _source, since_ts=0: queried.append(since_ts) or []
+
+        self.plugin._poll_plex_history(source, target)
+
+        self.assertEqual(queried, [98])
+
     def test_episode_matching_reads_with_authenticated_user_context(self):
         old_request_utils = WATCHSTATESYNC.RequestUtils
         try:
@@ -289,7 +430,9 @@ class WatchStateSyncTests(unittest.TestCase):
                 _host="http://jellyfin/",
                 user="server-user",
                 _apikey="api-key",
-                get_iteminfo=lambda item_id: types.SimpleNamespace(item_id=item_id),
+                get_iteminfo=lambda _item_id: (_ for _ in ()).throw(
+                    AssertionError("must not use MoviePilot server.get_iteminfo")
+                ),
             )
             target = FakeService("jellyfin", "jellyfin", target_server)
             state = WATCHSTATESYNC.NormalizedState(
@@ -332,6 +475,9 @@ class WatchStateSyncTests(unittest.TestCase):
             episode_call = next(call for call in RecordingRequestUtils.calls if "/Episodes" in call[1])
             self.assertEqual(episode_call[3]["userId"], "auth-user")
             self.assertNotIn("api_key", episode_call[3])
+            item_call = next(call for call in RecordingRequestUtils.calls if "/Items/episode-id" in call[1])
+            self.assertEqual(item_call[3]["userId"], "auth-user")
+            self.assertNotIn("server-user", item_call[1])
         finally:
             WATCHSTATESYNC.RequestUtils = old_request_utils
 
@@ -357,6 +503,101 @@ class WatchStateSyncTests(unittest.TestCase):
             self.assertEqual(params["positionTicks"], 1234 * 10000)
         finally:
             WATCHSTATESYNC.RequestUtils = old_request_utils
+
+    def test_outbox_drops_state_when_newer_source_event_exists(self):
+        old_state = self._state(source_event_at=100.0, source_sequence=1, progress_ms=120000)
+        new_state = self._state(source_event_at=110.0, source_sequence=2, progress_ms=240000)
+        self.plugin._test_data["outbox"] = [{
+            "key": self.plugin._source_event_key(old_state),
+            "source_server": "plex",
+            "target_server": "jellyfin",
+            "state": self.plugin._state_to_dict(old_state),
+            "source_event_at": old_state.source_event_at,
+            "source_sequence": old_state.source_sequence,
+            "target_item_id": "item-id",
+            "attempts": 1,
+            "next_attempt": 0,
+        }]
+        self.plugin._test_data["source_latest_events"] = {
+            self.plugin._source_event_identity(new_state): self.plugin._state_to_dict(new_state)
+        }
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+
+        self.plugin._process_outbox(target)
+
+        self.assertEqual(self.plugin._test_data["outbox"], [])
+        self.assertEqual(
+            self.plugin._test_data["diagnostics"]["outbox"]["stale_dropped"], 1
+        )
+
+    def test_outbox_progress_never_regresses_target_progress(self):
+        state = self._state(progress_ms=120000)
+        self.plugin._read_current_target_state = lambda *_args: {
+            "watched": False,
+            "progress_ms": 240000,
+        }
+
+        should_write, reason = self.plugin._target_needs_update(
+            types.SimpleNamespace(type="jellyfin"),
+            types.SimpleNamespace(item_id="item-id"),
+            state,
+            reject_progress_regression=True,
+        )
+
+        self.assertFalse(should_write)
+        self.assertIn("过期进度", reason)
+
+    def test_outbox_drops_old_watched_after_newer_unwatched_event(self):
+        old_state = self._state(
+            operation=WATCHSTATESYNC.StateOperation.WATCHED,
+            watched=True,
+            progress_ms=0,
+            percent=100,
+            source_event_at=100.0,
+            source_sequence=1,
+        )
+        new_state = self._state(
+            operation=WATCHSTATESYNC.StateOperation.UNWATCHED,
+            watched=False,
+            progress_ms=0,
+            percent=0,
+            source_event_at=110.0,
+            source_sequence=2,
+        )
+        self.plugin._test_data["outbox"] = [{
+            "key": self.plugin._source_event_key(old_state),
+            "source_server": "plex",
+            "target_server": "jellyfin",
+            "state": self.plugin._state_to_dict(old_state),
+            "source_event_at": old_state.source_event_at,
+            "source_sequence": old_state.source_sequence,
+            "target_item_id": "item-id",
+            "attempts": 0,
+            "next_attempt": 0,
+        }]
+        self.plugin._test_data["source_latest_events"] = {
+            self.plugin._source_event_identity(new_state): self.plugin._state_to_dict(new_state)
+        }
+
+        self.plugin._process_outbox(FakeService("jellyfin", "jellyfin", types.SimpleNamespace()))
+
+        self.assertEqual(self.plugin._test_data["outbox"], [])
+
+    def test_persistent_source_events_keep_concurrent_updates(self):
+        states = [
+            self._state(source_item_id=f"item-{index}", source_sequence=index + 1)
+            for index in range(20)
+        ]
+        threads = [
+            threading.Thread(target=self.plugin._remember_source_event, args=(state,))
+            for state in states
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(self.plugin._test_data["source_events"]), 20)
 
 if __name__ == "__main__":
     unittest.main()

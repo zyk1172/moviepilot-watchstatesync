@@ -3,6 +3,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.event import Event, eventmanager
@@ -52,13 +53,15 @@ class NormalizedState:
     episode_tmdb_id: Optional[int] = None
     episode_imdb_id: Optional[str] = None
     episode_tvdb_id: Optional[str] = None
+    source_event_at: float = 0.0
+    source_sequence: int = 0
 
 
 class WatchStateSync(_PluginBase):
     plugin_name = "观看进度同步"
     plugin_desc = "将 Plex 的已看状态与继续观看进度单向同步到 Jellyfin。"
     plugin_icon = "sync_file.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "OpenAI Codex"
     author_url = "https://openai.com"
     plugin_config_prefix = "watchstatesync_"
@@ -82,13 +85,18 @@ class WatchStateSync(_PluginBase):
     _jellyfin_username = ""
     _jellyfin_password = ""
 
-    _lock = threading.Lock()
+    # WebSocket、Webhook、定时任务和手动 API 可能同时触发同步。持久化数据必须
+    # 使用可重入锁做 get-modify-save，避免不同线程互相覆盖。
+    _lock = threading.RLock()
+    _sync_lock = threading.RLock()
+    _poll_lock = threading.RLock()
     _recent_writes: Dict[str, float] = {}
     _write_ttl_seconds = 180
     _max_history = 30
     _max_source_events = 2000
     _plex_history_page_size = 50
     _plex_history_max_pages = 200
+    _plex_history_overlap_seconds = 2
     _outbox_retry_base_seconds = 60
     _outbox_retry_max_seconds = 3600
     _jellyfin_auth_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -96,6 +104,7 @@ class WatchStateSync(_PluginBase):
     _plex_alert_listener: Any = None
     _plex_sessions: Dict[str, Dict[str, Any]] = {}
     _plex_user_identity_cache: Dict[str, List[str]] = {}
+    _source_sequence = 0
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -103,6 +112,7 @@ class WatchStateSync(_PluginBase):
         self._jellyfin_auth_cache = {}
         self._plex_sessions = {}
         self._plex_user_identity_cache = {}
+        self._source_sequence = self._safe_int(self.get_data("source_sequence"), 0)
 
         self._enabled = bool(config.get("enabled", False))
         self._server_a = (config.get("server_a") or "").strip()
@@ -158,6 +168,8 @@ class WatchStateSync(_PluginBase):
         if not self._enabled:
             return []
         if not self._has_plex_source():
+            return []
+        if not self._poll_plex and not self._use_websocket:
             return []
         return [{
             "id": "WatchStateSync_poll_plex",
@@ -330,7 +342,7 @@ class WatchStateSync(_PluginBase):
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "poll_plex",
-                                        "label": "无 Plex Pass 时轮询 Plex"
+                                        "label": "Plex 轮询 reconciliation（WebSocket 开启时始终保留）"
                                     }
                                 }]
                             }
@@ -346,7 +358,7 @@ class WatchStateSync(_PluginBase):
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "use_websocket",
-                                        "label": "使用 Plex 本地 WebSocket（实时信号，失败自动回退轮询）"
+                                        "label": "使用 Plex 本地 WebSocket（低延迟加速，轮询始终兜底）"
                                     }
                                 }]
                             }
@@ -619,6 +631,11 @@ class WatchStateSync(_PluginBase):
         self._cleanup_caches(force=True)
 
     def poll_plex_sources(self):
+        """串行执行轮询，避免手动同步与调度任务互相覆盖持久化状态。"""
+        with self._poll_lock:
+            self._poll_plex_sources_locked()
+
+    def _poll_plex_sources_locked(self):
         if not self._enabled:
             return
         if not self._server_a or not self._server_b:
@@ -641,7 +658,11 @@ class WatchStateSync(_PluginBase):
             target=self._server_b,
         )
         try:
-            if self._poll_plex:
+            if self._use_websocket:
+                # WebSocket 只负责低延迟加速；轮询始终作为 reconciliation，
+                # 即使配置曾关闭“无 Plex Pass 时轮询”也不能让实时监听失去兜底。
+                self._ensure_plex_alert_listener(source_service)
+            if self._poll_plex or self._use_websocket:
                 self._poll_single_plex_source(source_service, target_service)
             self._reconcile_plex_sessions(source_service, target_service)
             self._process_outbox(target_service)
@@ -710,9 +731,11 @@ class WatchStateSync(_PluginBase):
         last_seen = self._safe_int(self.get_data(state_key), 0)
         processed_ids = set(self.get_data(processed_key) or [])
 
-        # 首次运行不做全量回填，只处理最近一天；之后以游标为准。
+        # 首次运行不做全量回填，只处理最近一天；之后回退一个小窗口，
+        # 让同一秒内延迟出现的 history 事件仍有机会返回，再由 event-id 去重。
         since_ts = last_seen if last_seen else int(time.time()) - 24 * 3600
-        history = self._get_plex_history(source_service, since_ts=since_ts)
+        query_since = max(since_ts - self._plex_history_overlap_seconds, 0) if last_seen else since_ts
+        history = self._get_plex_history(source_service, since_ts=query_since)
         self._record_diagnostic(
             "plex_history",
             ok=True,
@@ -766,7 +789,8 @@ class WatchStateSync(_PluginBase):
         resume_items = source_service.instance.get_resume(num=50) or []
         self._record_diagnostic("plex_resume", ok=True, read=len(resume_items))
         snapshot_key = f"plex_resume_snapshot::{source_service.name}"
-        last_snapshot = self.get_data(snapshot_key) or {}
+        raw_snapshot = self.get_data(snapshot_key) or {}
+        last_snapshot = {str(key): value for key, value in raw_snapshot.items()}
         current_snapshot: Dict[str, Dict[str, Any]] = {}
 
         for resume in resume_items:
@@ -779,8 +803,12 @@ class WatchStateSync(_PluginBase):
             if not self._user_allowed(state):
                 logger.debug("观看进度同步：Plex 继续观看用户不在允许列表，跳过")
                 continue
+            snapshot_id = state.source_item_id or str(self._plex_item_reference(item_id))
             sec = int(state.progress_ms / 1000)
-            last_entry = last_snapshot.get(item_id)
+            last_entry = last_snapshot.get(snapshot_id)
+            if last_entry is None:
+                # 兼容 1.2.0 使用 int 作为快照 key 的旧数据。
+                last_entry = last_snapshot.get(str(item_id))
             last_sec = self._resume_snapshot_seconds(last_entry)
             snapshot_entry = {
                 "seconds": sec,
@@ -788,23 +816,24 @@ class WatchStateSync(_PluginBase):
                 "user_name": state.user_name,
             }
             if last_sec >= 0 and abs(sec - last_sec) < self._progress_delta_seconds:
-                current_snapshot[item_id] = snapshot_entry
+                current_snapshot[snapshot_id] = snapshot_entry
                 continue
             if last_sec < 0 and sec < self._min_progress_seconds:
-                current_snapshot[item_id] = snapshot_entry
+                current_snapshot[snapshot_id] = snapshot_entry
                 continue
             result = self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
             # 失败时不推进快照，下一轮继续重试；成功/跳过才更新快照。
             if result != "failed":
-                current_snapshot[item_id] = snapshot_entry
+                current_snapshot[snapshot_id] = snapshot_entry
 
         # Continue Watching 消失不等于已看。只回源确认 Plex 的最终 isPlayed/百分比，
         # 确认完成后才生成 WATCHED 操作；未完成的条目直接丢弃本轮快照。
         for item_id in set(last_snapshot) - set(current_snapshot):
             previous = last_snapshot.get(item_id)
             previous_user_id = previous.get("user_id") if isinstance(previous, dict) else None
+            previous_user_name = previous.get("user_name") if isinstance(previous, dict) else None
             state = self._build_plex_websocket_stopped_state(
-                source_service, item_id, previous_user_id
+                source_service, item_id, previous_user_id, previous_user_name
             )
             if not state or self._state_operation(state) != StateOperation.WATCHED:
                 continue
@@ -815,6 +844,7 @@ class WatchStateSync(_PluginBase):
                 current_snapshot[item_id] = previous if isinstance(previous, dict) else {
                     "seconds": self._resume_snapshot_seconds(previous),
                     "user_id": previous_user_id,
+                    "user_name": previous_user_name,
                 }
 
         self.save_data(snapshot_key, current_snapshot)
@@ -823,6 +853,30 @@ class WatchStateSync(_PluginBase):
         if isinstance(entry, dict):
             return self._safe_int(entry.get("seconds"), -1)
         return self._safe_int(entry, -1)
+
+    @staticmethod
+    def _plex_item_reference(item_id: Any) -> Any:
+        """把 Plex 的 ratingKey 转成 PlexAPI 能正确识别的引用。
+
+        Plex WebSocket 通知通常只给数字字符串（例如 ``"5033"``），而
+        PlexAPI 只有在收到 Python int 时才会自动补全 library metadata 路径。
+        history/WebSocket 若带有 ``/library/metadata/...`` 则保留原路径。
+        """
+        if isinstance(item_id, int):
+            return item_id
+        text = str(item_id).strip() if item_id is not None else ""
+        if text.isdigit():
+            return int(text)
+        return text
+
+    @staticmethod
+    def _plex_source_item_id(item_id: Any) -> str:
+        """为 history、polling 和 WebSocket 生成同一形式的源条目标识。"""
+        text = str(item_id).strip() if item_id is not None else ""
+        marker = "/library/metadata/"
+        if marker in text:
+            return text.split(marker, 1)[1].split("/", 1)[0]
+        return text
 
     def _get_plex_history(self, source_service: ServiceInfo, since_ts: int = 0, limit: Optional[int] = None) -> List[dict]:
         server = source_service.instance
@@ -887,9 +941,10 @@ class WatchStateSync(_PluginBase):
         item_key = history_item.get("key") or history_item.get("ratingKey")
         if not item_key:
             return None
+        item_reference = self._plex_item_reference(item_key)
         plex = source_service.instance.get_plex()
         try:
-            item = plex.fetchItem(item_key)
+            item = plex.fetchItem(item_reference)
         except Exception as err:
             logger.error(f"观看进度同步：读取 Plex 历史条目失败 {err}")
             raise
@@ -918,6 +973,7 @@ class WatchStateSync(_PluginBase):
             history_item.get("userName") or history_item.get("username")
         )
         user_name = user_name or self._plex_default_user_name(source_service.name)
+        source_event_at, source_sequence = self._new_source_event_meta(viewed_at or None)
         return NormalizedState(
             source_server=source_service.name,
             source_type="plex",
@@ -931,7 +987,7 @@ class WatchStateSync(_PluginBase):
             **self._provider_state_fields(ids, media_kind),
             season=self._coerce_int(getattr(item, "parentIndex", None)),
             episode=self._coerce_int(getattr(item, "index", None)),
-            source_item_id=item_key,
+            source_item_id=self._plex_source_item_id(item_reference),
             progress_ms=progress_ms,
             duration_ms=duration_ms,
             watched=watched,
@@ -939,12 +995,22 @@ class WatchStateSync(_PluginBase):
             played_at=played_at,
             user_id=user_id,
             operation=operation,
+            source_event_at=source_event_at,
+            source_sequence=source_sequence,
         )
 
-    def _build_plex_resume_state(self, source_service: ServiceInfo, item_id: str) -> Optional[NormalizedState]:
+    def _build_plex_resume_state(
+        self,
+        source_service: ServiceInfo,
+        item_id: Any,
+        user_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        fallback_to_token_owner: bool = True,
+    ) -> Optional[NormalizedState]:
         plex = source_service.instance.get_plex()
+        item_reference = self._plex_item_reference(item_id)
         try:
-            item = plex.fetchItem(item_id)
+            item = plex.fetchItem(item_reference)
         except Exception as err:
             logger.error(f"观看进度同步：读取 Plex 继续观看条目失败 {err}")
             return None
@@ -959,10 +1025,15 @@ class WatchStateSync(_PluginBase):
         ids = self._get_plex_provider_ids(plex, item, media_kind)
         user_id, user_name = self._plex_user_fields(
             plex,
-            getattr(item, "accountID", None),
-            getattr(item, "userName", None) or getattr(item, "username", None)
+            user_id or getattr(item, "accountID", None),
+            user_name or getattr(item, "userName", None) or getattr(item, "username", None)
         )
-        user_name = user_name or self._plex_default_user_name(source_service.name)
+        user_name = user_name or (
+            self._plex_default_user_name(source_service.name) if fallback_to_token_owner else None
+        )
+        source_event_at, source_sequence = self._new_source_event_meta(
+            self._to_timestamp(getattr(item, "lastViewedAt", None))
+        )
         return NormalizedState(
             source_server=source_service.name,
             source_type="plex",
@@ -976,7 +1047,7 @@ class WatchStateSync(_PluginBase):
             **self._provider_state_fields(ids, media_kind),
             season=self._coerce_int(getattr(item, "parentIndex", None)),
             episode=self._coerce_int(getattr(item, "index", None)),
-            source_item_id=item_id,
+            source_item_id=self._plex_source_item_id(item_reference),
             progress_ms=progress_ms,
             duration_ms=duration_ms,
             watched=False,
@@ -984,14 +1055,22 @@ class WatchStateSync(_PluginBase):
             played_at=self._to_iso(getattr(item, "lastViewedAt", None)),
             user_id=user_id,
             operation=StateOperation.PROGRESS,
+            source_event_at=source_event_at,
+            source_sequence=source_sequence,
         )
 
     def _build_plex_websocket_stopped_state(
-        self, source_service: ServiceInfo, item_id: str, account_id: Optional[str] = None
+        self,
+        source_service: ServiceInfo,
+        item_id: Any,
+        account_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        fallback_to_token_owner: bool = True,
     ) -> Optional[NormalizedState]:
         plex = source_service.instance.get_plex()
+        item_reference = self._plex_item_reference(item_id)
         try:
-            item = plex.fetchItem(item_id)
+            item = plex.fetchItem(item_reference)
         except Exception as err:
             logger.error(f"观看进度同步：读取 Plex WebSocket 停止条目失败 {err}")
             return None
@@ -1010,9 +1089,12 @@ class WatchStateSync(_PluginBase):
         user_id, user_name = self._plex_user_fields(
             plex,
             account_id or getattr(item, "accountID", None),
-            getattr(item, "userName", None) or getattr(item, "username", None)
+            user_name or getattr(item, "userName", None) or getattr(item, "username", None)
         )
-        user_name = user_name or self._plex_default_user_name(source_service.name)
+        user_name = user_name or (
+            self._plex_default_user_name(source_service.name) if fallback_to_token_owner else None
+        )
+        source_event_at, source_sequence = self._new_source_event_meta(time.time())
         return NormalizedState(
             source_server=source_service.name,
             source_type="plex",
@@ -1026,7 +1108,7 @@ class WatchStateSync(_PluginBase):
             **self._provider_state_fields(ids, media_kind),
             season=self._coerce_int(getattr(item, "parentIndex", None)),
             episode=self._coerce_int(getattr(item, "index", None)),
-            source_item_id=item_id,
+            source_item_id=self._plex_source_item_id(item_reference),
             progress_ms=progress_ms,
             duration_ms=duration_ms,
             watched=watched,
@@ -1034,6 +1116,8 @@ class WatchStateSync(_PluginBase):
             played_at=self._to_iso(getattr(item, "lastViewedAt", None)),
             user_id=user_id,
             operation=operation,
+            source_event_at=source_event_at,
+            source_sequence=source_sequence,
         )
 
 
@@ -1051,7 +1135,7 @@ class WatchStateSync(_PluginBase):
             series_ids: Dict[str, Optional[str]] = {"tmdb": None, "imdb": None, "tvdb": None}
             if show_key:
                 try:
-                    show = plex.fetchItem(show_key)
+                    show = plex.fetchItem(self._plex_item_reference(show_key))
                     series_ids = self._extract_provider_ids_from_plex_guids(
                         self._plex_guid_dicts(show)
                     )
@@ -1187,6 +1271,15 @@ class WatchStateSync(_PluginBase):
     def _sync_state_to_target(
         self, source_server: str, target_server: str, target_service: ServiceInfo, state: NormalizedState
     ) -> str:
+        """串行处理一个源事件，避免 WebSocket/Webhook/轮询并发写目标。"""
+        with self._sync_lock:
+            return self._sync_state_to_target_locked(
+                source_server, target_server, target_service, state
+            )
+
+    def _sync_state_to_target_locked(
+        self, source_server: str, target_server: str, target_service: ServiceInfo, state: NormalizedState
+    ) -> str:
         """返回 success / skipped / failed。failed 表示需要保留游标并进入 Outbox 重试。"""
         if not self._should_sync(state.progress_ms, state.duration_ms, state.watched, state.operation):
             self._remember_source_event(state)
@@ -1196,6 +1289,9 @@ class WatchStateSync(_PluginBase):
             return "skipped"
         if self._is_duplicate_source_event(state):
             return "skipped"
+        # 失败事件进入 Outbox 前也要记录为“已观察”，这样后来更新的源事件
+        # 成功或进入 Outbox 后，旧事件都不会在重试时倒灌覆盖新状态。
+        self._record_latest_source_state(state)
 
         try:
             target_item = self._find_target_item(target_service, state)
@@ -1270,8 +1366,9 @@ class WatchStateSync(_PluginBase):
         if not plex or not event_info.item_id:
             return None
 
+        item_reference = self._plex_item_reference(event_info.item_id)
         try:
-            item = plex.fetchItem(event_info.item_id)
+            item = plex.fetchItem(item_reference)
         except Exception as err:
             logger.error(f"观看进度同步：读取 Plex 条目失败 {err}")
             return None
@@ -1311,6 +1408,9 @@ class WatchStateSync(_PluginBase):
         if not self._should_sync(progress_ms, duration_ms, watched, operation):
             return None
 
+        source_event_at, source_sequence = self._new_source_event_meta(
+            self._to_timestamp(getattr(item, "lastViewedAt", None))
+        )
         return NormalizedState(
             source_server=service.name,
             source_type="plex",
@@ -1324,7 +1424,7 @@ class WatchStateSync(_PluginBase):
             **self._provider_state_fields(ids, media_kind),
             season=self._coerce_int(season),
             episode=self._coerce_int(episode),
-            source_item_id=event_info.item_id,
+            source_item_id=self._plex_source_item_id(item_reference),
             progress_ms=progress_ms,
             duration_ms=duration_ms,
             watched=watched,
@@ -1332,6 +1432,8 @@ class WatchStateSync(_PluginBase):
             played_at=self._to_iso(getattr(item, "lastViewedAt", None)),
             user_id=self._coerce_str(payload.get("AccountID") or metadata.get("accountID")),
             operation=operation,
+            source_event_at=source_event_at,
+            source_sequence=source_sequence,
         )
 
     def _find_target_item(self, target_service: ServiceInfo, state: NormalizedState) -> Optional[MediaServerItem]:
@@ -1379,7 +1481,7 @@ class WatchStateSync(_PluginBase):
                 self._coerce_int(item.get("ParentIndexNumber")) == season
                 and self._coerce_int(item.get("IndexNumber")) == episode
             ):
-                return server.get_iteminfo(item.get("Id"))
+                return self._get_jellyfin_iteminfo(server, item.get("Id"), context)
         # 季号没对齐时不使用“全剧唯一同集号”的低置信度兜底，宁可不写，避免写错季/错集。
         return None
 
@@ -1395,8 +1497,45 @@ class WatchStateSync(_PluginBase):
         )
         best = self._pick_best_jellyfin_match(candidates, state, media_kind="movie")
         if best:
-            return server.get_iteminfo(best.get("Id"))
+            return self._get_jellyfin_iteminfo(server, best.get("Id"))
         return None
+
+    def _get_jellyfin_iteminfo(
+        self,
+        server: Any,
+        item_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[MediaServerItem]:
+        """用插件自己的目标用户上下文读取 Jellyfin 条目。
+
+        MoviePilot 的 ``server.get_iteminfo`` 固定使用 server.user，可能与插件
+        登录用户不同；匹配、读取 UserData、写回和验证必须始终使用同一身份。
+        """
+        if not item_id:
+            return None
+        context = context or self._get_jellyfin_request_context(server)
+        if not context:
+            raise RuntimeError("missing jellyfin user context")
+        url = f"{server._host}Users/{context['user_id']}/Items/{item_id}"
+        res = RequestUtils(headers=context["headers"]).get_res(
+            url, params=context["params"].copy()
+        )
+        if not res:
+            raise RuntimeError("Jellyfin item query failed (n/a)")
+        if res.status_code in [401, 403]:
+            self._invalidate_jellyfin_auth(server)
+            raise RuntimeError(f"Jellyfin item query failed ({res.status_code})")
+        if res.status_code == 404:
+            return None
+        if res.status_code >= 300:
+            raise RuntimeError(f"Jellyfin item query failed ({res.status_code})")
+        try:
+            payload = res.json() or {}
+        except Exception as err:
+            raise RuntimeError(f"Jellyfin item query returned invalid JSON: {err}") from err
+        resolved_id = payload.get("Id") or item_id
+        # 同步逻辑只依赖 item_id；SimpleNamespace 避免再次走 server.user。
+        return SimpleNamespace(item_id=str(resolved_id))
 
     def _find_jellyfin_series_id_fallback(
         self, target_service: ServiceInfo, state: NormalizedState
@@ -1716,7 +1855,11 @@ class WatchStateSync(_PluginBase):
         return True
 
     def _target_needs_update(
-        self, target_service: ServiceInfo, target_item: MediaServerItem, state: NormalizedState
+        self,
+        target_service: ServiceInfo,
+        target_item: MediaServerItem,
+        state: NormalizedState,
+        reject_progress_regression: bool = False,
     ) -> Tuple[bool, str]:
         current = self._read_current_target_state(target_service, target_item)
         if not current:
@@ -1737,9 +1880,13 @@ class WatchStateSync(_PluginBase):
             return True, "需要取消已看"
 
         if current_watched:
+            if reject_progress_regression:
+                return False, "目标已有更新的已看状态，丢弃过期进度"
             return True, "目标当前为已看，需要改成继续观看"
 
         delta_ms = abs(current_progress_ms - state.progress_ms)
+        if reject_progress_regression and current_progress_ms > state.progress_ms:
+            return False, "目标已有更高进度，丢弃过期进度"
         if delta_ms < self._progress_delta_seconds * 1000:
             return False, f"目标进度差仅 {int(delta_ms / 1000)} 秒"
         return True, "进度变化达到阈值"
@@ -1803,19 +1950,102 @@ class WatchStateSync(_PluginBase):
             if not plex:
                 return
             self._stop_plex_alert_listener()
-            self._plex_alert_listener = plex.startAlertListener(self._on_plex_alert)
+            listener = plex.startAlertListener(self._on_plex_alert)
+            with self._lock:
+                self._plex_alert_listener = listener
+            self._record_diagnostic("plex_websocket", status="started")
             logger.info("观看进度同步：已启动 Plex 本地 WebSocket AlertListener")
         except Exception as err:
+            self._record_diagnostic("plex_websocket", status="failed", error=str(err))
             logger.error(f"观看进度同步：启动 Plex WebSocket 失败，继续依赖轮询 {err}")
 
+    @staticmethod
+    def _plex_alert_listener_is_alive(listener: Any) -> bool:
+        """尽量检查不同 PlexAPI AlertListener 版本暴露的线程状态。"""
+        if listener is None:
+            return False
+        for method_name in ("is_alive", "isAlive"):
+            method = getattr(listener, method_name, None)
+            if callable(method):
+                try:
+                    return bool(method())
+                except Exception:
+                    return False
+        for attr_name in ("running", "is_running"):
+            value = getattr(listener, attr_name, None)
+            if value is not None:
+                return bool(value() if callable(value) else value)
+        # 某些 PlexAPI 版本只返回一个没有状态属性的控制对象，不能据此误判断线。
+        return True
+
+    def _ensure_plex_alert_listener(self, source_service: ServiceInfo):
+        with self._lock:
+            listener = self._plex_alert_listener
+        if listener is not None and self._plex_alert_listener_is_alive(listener):
+            return
+        if listener is not None:
+            logger.warning("观看进度同步：检测到 Plex WebSocket listener 已停止，正在重连")
+            self._record_diagnostic("plex_websocket", status="reconnecting")
+        self._start_plex_alert_listener()
+
     def _stop_plex_alert_listener(self):
-        listener = self._plex_alert_listener
-        self._plex_alert_listener = None
+        with self._lock:
+            listener = self._plex_alert_listener
+            self._plex_alert_listener = None
         if listener:
             try:
                 listener.stop()
             except Exception:
                 pass
+
+    def _resolve_plex_session_user(
+        self, plex: Any, session_key: Optional[str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """通过 sessionKey 查询当前播放 session 的真实 Plex 用户。"""
+        if not session_key:
+            return None, None
+        try:
+            sessions = plex.sessions() or []
+        except Exception as err:
+            logger.warning(f"观看进度同步：读取 Plex session 用户失败 {err}")
+            return None, None
+
+        for session in sessions:
+            current_key = (
+                getattr(session, "sessionKey", None)
+                or getattr(session, "session", None)
+                or getattr(session, "key", None)
+            )
+            if current_key is None or str(current_key) != str(session_key):
+                continue
+
+            user = getattr(session, "user", None)
+            account_id = None
+            user_name = None
+            if isinstance(user, dict):
+                account_id = user.get("id") or user.get("accountID") or user.get("accountId")
+                user_name = user.get("title") or user.get("username") or user.get("name")
+            elif user is not None and not isinstance(user, (str, int, float)):
+                account_id = (
+                    getattr(user, "id", None)
+                    or getattr(user, "accountID", None)
+                    or getattr(user, "accountId", None)
+                )
+                user_name = (
+                    getattr(user, "title", None)
+                    or getattr(user, "username", None)
+                    or getattr(user, "name", None)
+                )
+            elif user is not None:
+                user_name = str(user)
+
+            account_id = account_id or getattr(session, "accountID", None)
+            account_id = account_id or getattr(session, "accountId", None)
+            user_name = user_name or getattr(session, "username", None)
+            user_name = user_name or getattr(session, "userName", None)
+            return self._plex_user_fields(plex, account_id, user_name)
+
+        return None, None
 
     def _on_plex_alert(self, data: dict):
         try:
@@ -1841,37 +2071,75 @@ class WatchStateSync(_PluginBase):
 
         state_name = (notif.get("state") or notif.get("State") or "").lower()
         session_key = str(notif.get("sessionKey") or notif.get("SessionKey") or rating_key)
-        account_id = self._coerce_str(notif.get("accountID") or notif.get("AccountID"))
+        item_key = notif.get("key") or notif.get("Key") or self._plex_item_reference(rating_key)
+        plex = source_service.instance.get_plex()
+        notification_user_id = self._coerce_str(
+            notif.get("accountID") or notif.get("AccountID")
+        )
+        session_user_id, session_user_name = self._resolve_plex_session_user(plex, session_key)
+        with self._lock:
+            previous_session = dict(self._plex_sessions.get(session_key) or {})
+        user_id = session_user_id or notification_user_id or previous_session.get("user_id")
+        user_name = session_user_name or previous_session.get("user_name")
+        if not session_user_id and notification_user_id:
+            user_id, user_name = self._plex_user_fields(plex, user_id, user_name)
+        if not user_id and not user_name:
+            # WebSocket 通知通常没有用户字段，绝不能把 token owner 猜成当前播放用户。
+            # 等待下一次 polling 或带有 session 用户信息的通知。
+            logger.warning(
+                f"观看进度同步：Plex WebSocket session {session_key} 缺少真实用户，跳过"
+            )
+            self._record_diagnostic("plex_websocket", status="missing_user")
+            return
 
         if state_name == "stopped":
-            self._plex_sessions.pop(session_key, None)
-            state = self._build_plex_websocket_stopped_state(source_service, str(rating_key), account_id)
+            with self._lock:
+                self._plex_sessions.pop(session_key, None)
+            state = self._build_plex_websocket_stopped_state(
+                source_service,
+                item_key,
+                user_id,
+                user_name,
+                False,
+            )
             if state:
                 self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
             return
 
         # playing / paused / buffering 等：不直接信任通知里的进度，回源读取当前 item 状态。
-        state = self._build_plex_resume_state(source_service, str(rating_key))
+        state = self._build_plex_resume_state(
+            source_service,
+            item_key,
+            user_id,
+            user_name,
+            False,
+        )
         if not state:
             return
         state.event_type = "websocket.playing"
-        state.user_id = account_id
+        state.user_id = user_id or state.user_id
+        state.user_name = user_name or state.user_name
         sec = int(state.progress_ms / 1000)
-        last = self._plex_sessions.get(session_key, {}).get("last_sec")
+        with self._lock:
+            last = self._plex_sessions.get(session_key, {}).get("last_sec")
         if last is not None and abs(sec - last) < self._progress_delta_seconds:
+            with self._lock:
+                self._plex_sessions[session_key] = {
+                    "item_key": str(item_key),
+                    "last_sec": sec,
+                    "state": state_name,
+                    "user_id": state.user_id,
+                    "user_name": state.user_name,
+                }
+            return
+        with self._lock:
             self._plex_sessions[session_key] = {
-                "rating_key": str(rating_key),
+                "item_key": str(item_key),
                 "last_sec": sec,
                 "state": state_name,
-                "user_id": account_id
+                "user_id": state.user_id,
+                "user_name": state.user_name,
             }
-            return
-        self._plex_sessions[session_key] = {
-            "rating_key": str(rating_key),
-            "last_sec": sec,
-            "state": state_name,
-            "user_id": account_id
-        }
         self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
 
     def _reconcile_plex_sessions(self, source_service: ServiceInfo, target_service: ServiceInfo):
@@ -1884,14 +2152,23 @@ class WatchStateSync(_PluginBase):
                 key = getattr(session, "sessionKey", None) or getattr(session, "session", None)
                 if key is not None:
                     active_keys.add(str(key))
-            for session_key, info in list(self._plex_sessions.items()):
+            with self._lock:
+                tracked_sessions = list(self._plex_sessions.items())
+            for session_key, info in tracked_sessions:
                 if session_key in active_keys:
                     continue
-                self._plex_sessions.pop(session_key, None)
-                rating_key = info.get("rating_key")
-                if not rating_key:
+                with self._lock:
+                    self._plex_sessions.pop(session_key, None)
+                item_key = info.get("item_key")
+                if not item_key or not (info.get("user_id") or info.get("user_name")):
                     continue
-                state = self._build_plex_websocket_stopped_state(source_service, rating_key, info.get("user_id"))
+                state = self._build_plex_websocket_stopped_state(
+                    source_service,
+                    item_key,
+                    info.get("user_id"),
+                    info.get("user_name"),
+                    False,
+                )
                 if state:
                     state.event_type = "session.lost"
                     self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
@@ -1911,18 +2188,85 @@ class WatchStateSync(_PluginBase):
             state.user_id or ""
         ])
 
+    def _source_event_identity(self, state: NormalizedState) -> str:
+        """同一条媒体、同一用户的不同操作共享一个事件顺序。"""
+        item_id = state.source_item_id or ""
+        if not item_id:
+            item_id = "|".join([
+                state.media_kind or "",
+                state.title or "",
+                str(state.season or ""),
+                str(state.episode or ""),
+            ])
+        # 优先使用可读用户名，让 history 的 accountID+名称与 WebSocket
+        # session 的用户对象能够落到同一个身份；没有名称时再退回 ID。
+        user = state.user_name or state.user_id or ""
+        return "|".join([state.source_server or "", item_id, user])
+
+    @staticmethod
+    def _event_version(value: Any) -> Tuple[float, int]:
+        if isinstance(value, NormalizedState):
+            return (
+                WatchStateSync._safe_float(value.source_event_at, 0.0),
+                WatchStateSync._safe_int(value.source_sequence, 0),
+            )
+        return (
+            WatchStateSync._safe_float(value.get("source_event_at"), 0.0),
+            WatchStateSync._safe_int(value.get("source_sequence"), 0),
+        )
+
+    def _new_source_event_meta(self, event_at: Optional[float] = None) -> Tuple[float, int]:
+        event_timestamp = self._safe_float(event_at, 0.0) or time.time()
+        with self._lock:
+            persisted = self._safe_int(self.get_data("source_sequence"), 0)
+            self._source_sequence = max(self._source_sequence, persisted) + 1
+            sequence = self._source_sequence
+            self.save_data("source_sequence", sequence)
+        return event_timestamp, sequence
+
     def _load_source_events(self) -> List[str]:
-        return list(self.get_data("source_events") or [])
+        with self._lock:
+            return list(self.get_data("source_events") or [])
 
     def _remember_source_event(self, state: NormalizedState):
         key = self._source_event_key(state)
-        events = self._load_source_events()
-        if key not in events:
-            events.insert(0, key)
-            self.save_data("source_events", events[:self._max_source_events])
+        with self._lock:
+            events = list(self.get_data("source_events") or [])
+            if key not in events:
+                events.insert(0, key)
+                self.save_data("source_events", events[:self._max_source_events])
 
     def _is_duplicate_source_event(self, state: NormalizedState) -> bool:
-        return self._source_event_key(state) in set(self._load_source_events())
+        with self._lock:
+            return self._source_event_key(state) in set(self.get_data("source_events") or [])
+
+    def _record_latest_source_state(self, state: NormalizedState):
+        """记录最新已观察到的源事件，供旧 Outbox 在重试前丢弃。"""
+        identity = self._source_event_identity(state)
+        version = self._event_version(state)
+        with self._lock:
+            latest = dict(self.get_data("source_latest_events") or {})
+            current = latest.get(identity) or {}
+            if current and self._event_version(current) >= version:
+                return
+            latest[identity] = {
+                "source_event_at": version[0],
+                "source_sequence": version[1],
+                "key": self._source_event_key(state),
+                "operation": self._state_operation(state),
+                "progress_ms": state.progress_ms,
+            }
+            self.save_data("source_latest_events", latest)
+
+    def _outbox_is_stale(self, entry: Dict[str, Any], state: NormalizedState) -> bool:
+        """判断 Outbox 是否早于同媒体用户后来观察到的源事件。"""
+        identity = self._source_event_identity(state)
+        with self._lock:
+            latest = (self.get_data("source_latest_events") or {}).get(identity)
+        if not latest:
+            return False
+        entry_version = self._event_version(entry)
+        return self._event_version(latest) > entry_version
 
     def _state_to_dict(self, state: NormalizedState) -> Dict[str, Any]:
         return {
@@ -1954,6 +2298,8 @@ class WatchStateSync(_PluginBase):
             "episode_tmdb_id": state.episode_tmdb_id,
             "episode_imdb_id": state.episode_imdb_id,
             "episode_tvdb_id": state.episode_tvdb_id,
+            "source_event_at": state.source_event_at,
+            "source_sequence": state.source_sequence,
         }
 
     @staticmethod
@@ -1993,34 +2339,56 @@ class WatchStateSync(_PluginBase):
             episode_tmdb_id=WatchStateSync._coerce_int(data.get("episode_tmdb_id")),
             episode_imdb_id=data.get("episode_imdb_id"),
             episode_tvdb_id=data.get("episode_tvdb_id"),
+            source_event_at=WatchStateSync._safe_float(data.get("source_event_at", 0), 0.0),
+            source_sequence=WatchStateSync._safe_int(data.get("source_sequence", 0)),
         )
 
     def _load_outbox(self) -> List[Dict[str, Any]]:
-        return list(self.get_data("outbox") or [])
+        with self._lock:
+            return list(self.get_data("outbox") or [])
 
     def _save_outbox(self, outbox: List[Dict[str, Any]]):
-        self.save_data("outbox", outbox[:500])
+        with self._lock:
+            self.save_data("outbox", outbox[:500])
 
     def _enqueue_outbox(
         self, source_server: str, target_server: str, state: NormalizedState, target_item: Optional[MediaServerItem]
     ):
         key = self._source_event_key(state)
-        outbox = self._load_outbox()
-        if any(item.get("key") == key for item in outbox):
-            return
-        outbox.append({
-            "key": key,
-            "source_server": source_server,
-            "target_server": target_server,
-            "state": self._state_to_dict(state),
-            "target_item_id": target_item.item_id if target_item else None,
-            "attempts": 0,
-            "next_attempt": 0,
-            "created_at": time.time()
-        })
-        self._save_outbox(outbox)
+        with self._lock:
+            outbox = list(self.get_data("outbox") or [])
+            for item in outbox:
+                if item.get("key") != key:
+                    continue
+                # 同一进度在网络故障期间会被轮询反复观察；更新事件版本，
+                # 但保留已有退避次数，避免旧版本检查把当前重试项误删。
+                item.update({
+                    "source_event_at": state.source_event_at,
+                    "source_sequence": state.source_sequence,
+                    "state": self._state_to_dict(state),
+                    "target_item_id": target_item.item_id if target_item else item.get("target_item_id"),
+                })
+                self.save_data("outbox", outbox[:500])
+                return
+            outbox.append({
+                "key": key,
+                "source_server": source_server,
+                "target_server": target_server,
+                "state": self._state_to_dict(state),
+                "source_event_at": state.source_event_at,
+                "source_sequence": state.source_sequence,
+                "target_item_id": target_item.item_id if target_item else None,
+                "attempts": 0,
+                "next_attempt": 0,
+                "created_at": time.time()
+            })
+            self.save_data("outbox", outbox[:500])
 
     def _process_outbox(self, target_service: ServiceInfo):
+        with self._sync_lock:
+            self._process_outbox_locked(target_service)
+
+    def _process_outbox_locked(self, target_service: ServiceInfo):
         outbox = self._load_outbox()
         if not outbox:
             return
@@ -2032,6 +2400,11 @@ class WatchStateSync(_PluginBase):
                 remaining.append(entry)
                 continue
             state = self._state_from_dict(entry.get("state") or {})
+            if self._outbox_is_stale(entry, state):
+                self._remember_source_event(state)
+                self._increment_diagnostic("outbox", "stale_dropped")
+                changed = True
+                continue
             if not self._should_sync(state.progress_ms, state.duration_ms, state.watched, state.operation):
                 self._remember_source_event(state)
                 changed = True
@@ -2043,7 +2416,9 @@ class WatchStateSync(_PluginBase):
             target_item = None
             if entry.get("target_item_id"):
                 try:
-                    target_item = target_service.instance.get_iteminfo(entry["target_item_id"])
+                    target_item = self._get_jellyfin_iteminfo(
+                        target_service.instance, entry["target_item_id"]
+                    )
                 except Exception:
                     target_item = None
             try:
@@ -2072,7 +2447,9 @@ class WatchStateSync(_PluginBase):
                 continue
 
             try:
-                should_write, reason = self._target_needs_update(target_service, target_item, state)
+                should_write, reason = self._target_needs_update(
+                    target_service, target_item, state, reject_progress_regression=True
+                )
             except Exception as err:
                 should_write, reason = True, f"目标状态读取异常: {err}"
             if not should_write:
@@ -2144,27 +2521,29 @@ class WatchStateSync(_PluginBase):
         }
 
     def _clear_history_data(self) -> Dict[str, Any]:
-        history_count = len(self.get_data("history") or [])
-        outbox_count = len(self.get_data("outbox") or [])
-        self.save_data("history", [])
-        self.save_data("outbox", [])
-        self.save_data("source_events", [])
-        self.save_data("diagnostics", {})
+        with self._lock:
+            history_count = len(self.get_data("history") or [])
+            outbox_count = len(self.get_data("outbox") or [])
+            self.save_data("history", [])
+            self.save_data("outbox", [])
+            self.save_data("source_events", [])
+            self.save_data("source_latest_events", {})
+            self.save_data("diagnostics", {})
 
-        reset_keys = []
-        for service_name in [self._server_a, self._server_b]:
-            if not service_name:
-                continue
-            history_key = f"plex_history_ts::{service_name}"
-            snapshot_key = f"plex_resume_snapshot::{service_name}"
-            processed_key = f"plex_history_processed::{service_name}"
-            self.save_data(history_key, 0)
-            self.save_data(snapshot_key, {})
-            self.save_data(processed_key, [])
-            reset_keys.extend([history_key, snapshot_key, processed_key])
+            reset_keys = []
+            for service_name in [self._server_a, self._server_b]:
+                if not service_name:
+                    continue
+                history_key = f"plex_history_ts::{service_name}"
+                snapshot_key = f"plex_resume_snapshot::{service_name}"
+                processed_key = f"plex_history_processed::{service_name}"
+                self.save_data(history_key, 0)
+                self.save_data(snapshot_key, {})
+                self.save_data(processed_key, [])
+                reset_keys.extend([history_key, snapshot_key, processed_key])
 
-        self._cleanup_caches(force=True)
-        self._plex_sessions = {}
+            self._cleanup_caches(force=True)
+            self._plex_sessions = {}
         logger.info("观看进度同步：已清除历史数据、Outbox 并重置轮询游标")
         return {
             "history_count": history_count,
@@ -2265,29 +2644,32 @@ class WatchStateSync(_PluginBase):
         }
 
     def _record_diagnostic(self, section: str, **values: Any):
-        diagnostics = self.get_data("diagnostics") or {}
-        current = diagnostics.get(section) or {}
-        current.update(values)
-        current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        diagnostics[section] = current
-        self.save_data("diagnostics", diagnostics)
+        with self._lock:
+            diagnostics = dict(self.get_data("diagnostics") or {})
+            current = dict(diagnostics.get(section) or {})
+            current.update(values)
+            current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            diagnostics[section] = current
+            self.save_data("diagnostics", diagnostics)
 
     def _increment_diagnostic(self, section: str, key: str, amount: int = 1):
-        diagnostics = self.get_data("diagnostics") or {}
-        current = diagnostics.get(section) or {}
-        current[key] = self._safe_int(current.get(key), 0) + amount
-        current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        diagnostics[section] = current
-        self.save_data("diagnostics", diagnostics)
+        with self._lock:
+            diagnostics = dict(self.get_data("diagnostics") or {})
+            current = dict(diagnostics.get(section) or {})
+            current[key] = self._safe_int(current.get(key), 0) + amount
+            current["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            diagnostics[section] = current
+            self.save_data("diagnostics", diagnostics)
 
     def _record_history(self, title: str, subtitle: str):
-        history = self.get_data("history") or []
-        history.insert(0, {
-            "title": title,
-            "subtitle": subtitle,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        self.save_data("history", history[:self._max_history])
+        with self._lock:
+            history = list(self.get_data("history") or [])
+            history.insert(0, {
+                "title": title,
+                "subtitle": subtitle,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            self.save_data("history", history[:self._max_history])
 
     @staticmethod
     def _extract_provider_ids_from_plex_guids(guids: List[dict]) -> Dict[str, Optional[str]]:
@@ -2309,6 +2691,24 @@ class WatchStateSync(_PluginBase):
         return None
 
     @staticmethod
+    def _to_timestamp(value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except Exception:
+                return None
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
     def _coerce_int(value: Any) -> Optional[int]:
         if value is None or value == "":
             return None
@@ -2327,6 +2727,13 @@ class WatchStateSync(_PluginBase):
     def _safe_int(value: Any, default: int = 0) -> int:
         try:
             return int(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
         except Exception:
             return default
 
