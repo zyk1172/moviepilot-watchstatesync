@@ -4,7 +4,7 @@
 
 ## Beta 状态
 
-当前仓库处于 `beta` 阶段，定位很明确：
+当前仓库处于 `beta` 阶段，版本为 `1.2.0`，定位很明确：
 
 - 只做 `Plex -> Jellyfin`
 - 不再支持双向同步
@@ -20,11 +20,15 @@
   - Continue Watching
 - 支持清除插件历史数据和 Plex 轮询游标
 - Jellyfin 继续观看写回支持用户名/密码登录换取用户 token
+- Jellyfin 读取、匹配、写回和写后验证共用同一个 Jellyfin 用户上下文
+- Plex history 使用分页和游标，失败事件进入 Outbox 重试
+- 插件页提供最近轮询、匹配、写回和验证诊断，并支持立即轮询一次
 
 ## 当前限制
 
 - 依赖 MoviePilot 先正确配置好 Plex 和 Jellyfin 媒体服务器
 - 更适合单用户场景
+- 多用户 Plex 请填写“允许同步的用户名或 Plex accountId”；未填写时插件会尽量限制为 Plex token 对应账户
 - 不做历史全量回填
 - 媒体匹配仍依赖 Plex/Jellyfin 两边刮削结果尽量一致
 - 双向同步已从仓库定位中移除
@@ -38,9 +42,9 @@
    - `Plex 源服务器`
    - `Jellyfin 目标服务器`
 5. 如果 Plex 没有会员，开启插件中的 Plex 轮询。
-6. 如果需要同步 Jellyfin `继续观看`，额外填写：
-   - `Jellyfin 用户名`
-   - `Jellyfin 密码`
+6. 如果开启 `同步继续观看进度`，必须填写 Jellyfin 用户名和密码。该身份用于目标状态读取、匹配、写回和写后验证；不要让 MoviePilot 媒体服务器用户与插件登录用户不一致。
+7. 如有多个 Plex 用户，填写：
+   - `允许同步的用户名或 Plex accountId`
 
 ## 推荐配置
 
@@ -53,5 +57,6 @@
 ## 已知情况
 
 - `已看状态` 目前比 `继续观看进度` 更稳
-- Jellyfin 继续观看若只使用 API Key，部分环境下会出现接口返回成功但不持久化的问题
-- 当前版本已改为使用 Jellyfin 用户登录态 token 处理继续观看写回
+- Jellyfin 继续观看必须使用用户登录态 token；仅 API Key 不会执行进度写回
+- 每次写回后都会重新读取 Jellyfin UserData；验证失败会重试一次并保留 Outbox
+- 当前插件实现仍是 MoviePilot V2（`package.v2.json` / `plugins.v2`），不包含 V3 实现
