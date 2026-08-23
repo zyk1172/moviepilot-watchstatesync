@@ -121,12 +121,16 @@ class PlexItem:
 
 
 class FakePlex:
-    def __init__(self, items=None, sessions=None, user_servers=None, continue_items=None):
+    def __init__(self, items=None, sessions=None, user_servers=None, continue_items=None, accounts=None):
         self.items = items or {}
         self.fetches = []
         self._sessions = sessions or []
         self.user_servers = user_servers or {}
         self.continue_items = continue_items or []
+        self.accounts = accounts or [
+            types.SimpleNamespace(id="1", title="alice"),
+            types.SimpleNamespace(id="7", title="bob"),
+        ]
         self.fetch_items_calls = []
         self.switches = []
 
@@ -140,6 +144,9 @@ class FakePlex:
 
     def systemAccount(self, account_id):
         return types.SimpleNamespace(id=account_id, title="alice")
+
+    def systemAccounts(self):
+        return list(self.accounts)
 
     def myPlexAccount(self):
         return types.SimpleNamespace(id="1", username="alice", title="alice")
@@ -597,6 +604,70 @@ class WatchStateSyncTests(unittest.TestCase):
         event_id = self.plugin._history_event_id(history_item)
         self.assertIn(event_id, self.plugin._test_data["plex_history_processed::plex"])
 
+    def test_history_filters_source_user_before_building_state(self):
+        source_plex = FakePlex()
+        source = FakeService("plex", "plex", FakeSourceInstance(source_plex))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._source_user = "bob"
+        self.plugin._allowed_users = ["bob"]
+        self.plugin._test_data["plex_history_ts::plex"] = 100
+        history = [
+            {
+                "viewedAt": 101,
+                "id": "charlie-event",
+                "accountID": "8",
+                "key": "/library/metadata/charlie",
+            },
+            {
+                "viewedAt": 99,
+                "id": "bob-event",
+                "accountID": "7",
+                "key": "/library/metadata/bob",
+            },
+        ]
+        queried = []
+        built = []
+        self.plugin._get_plex_history = (
+            lambda _source, since_ts=0, account_id=None:
+            queried.append((since_ts, account_id)) or history
+        )
+        self.plugin._build_plex_history_state = (
+            lambda _source, item: built.append(item) or None
+        )
+
+        self.plugin._poll_plex_history(source, target)
+
+        self.assertEqual(queried, [(98, "7")])
+        self.assertEqual([item["id"] for item in built], ["bob-event"])
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 101)
+        processed = self.plugin._test_data["plex_history_processed::plex"]
+        self.assertIn(self.plugin._history_event_id(history[0]), processed)
+        self.assertIn(self.plugin._history_event_id(history[1]), processed)
+
+    def test_history_identity_failure_never_falls_back_to_configured_user(self):
+        item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
+        plex = FakePlex({"/library/metadata/5033": item})
+        plex.systemAccount = lambda _account_id: (_ for _ in ()).throw(
+            RuntimeError("account lookup unavailable")
+        )
+        source = FakeService("plex", "plex", FakeSourceInstance(plex))
+        self.plugin._source_user = "bob"
+        self.plugin._allowed_users = ["bob"]
+
+        state = self.plugin._build_plex_history_state(
+            source,
+            {
+                "key": "/library/metadata/5033",
+                "viewedAt": 200,
+                "accountID": "1",
+            },
+        )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.user_id, "1")
+        self.assertIsNone(state.user_name)
+        self.assertFalse(self.plugin._user_allowed(state))
+
     def test_webhook_source_event_uses_payload_time_not_last_viewed_at(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000, isPlayed=True)
         item.lastViewedAt = datetime.fromtimestamp(100, tz=timezone.utc)
@@ -769,6 +840,52 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertFalse(self.plugin._source_user_invalid)
         self.assertEqual(self.plugin._plex_source_user_fields(), (None, "Bob"))
         self.assertTrue(self.plugin._user_allowed(self._state(user_name="bob")))
+
+    def test_source_user_change_resets_reconciliation_state(self):
+        self.plugin._test_data.update({
+            "sync_scope": "plex|alice",
+            "plex_history_ts::plex": 100,
+            "plex_history_processed::plex": ["alice-event"],
+            "plex_resume_snapshot::plex": {"5033": {"seconds": 120}},
+        })
+        self.plugin._plex_sessions = {"session-1": {"user_name": "alice"}}
+        self.plugin._plex_user_identity_cache = {"plex": ["alice", "1"]}
+        self.plugin._plex_user_servers = {("plex", "alice"): object()}
+
+        self.plugin.init_plugin({
+            "server_a": "plex",
+            "server_b": "jellyfin",
+            "allowed_users": "bob",
+        })
+
+        self.assertEqual(self.plugin._test_data["sync_scope"], "plex|bob")
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 0)
+        self.assertEqual(self.plugin._test_data["plex_history_processed::plex"], [])
+        self.assertEqual(self.plugin._test_data["plex_resume_snapshot::plex"], {})
+        self.assertEqual(self.plugin._plex_sessions, {})
+        self.assertEqual(self.plugin._plex_user_identity_cache, {})
+        self.assertEqual(self.plugin._plex_user_servers, {})
+
+    def test_source_scope_comparison_is_case_insensitive(self):
+        self.plugin._test_data.update({
+            "sync_scope": "PLEX|BOB",
+            "plex_history_ts::plex": 100,
+            "plex_history_processed::plex": ["bob-event"],
+            "plex_resume_snapshot::plex": {"5033": {"seconds": 120}},
+        })
+
+        self.plugin.init_plugin({
+            "server_a": "plex",
+            "server_b": "jellyfin",
+            "allowed_users": "bob",
+        })
+
+        self.assertEqual(self.plugin._test_data["plex_history_ts::plex"], 100)
+        self.assertEqual(self.plugin._test_data["plex_history_processed::plex"], ["bob-event"])
+        self.assertEqual(
+            self.plugin._test_data["plex_resume_snapshot::plex"],
+            {"5033": {"seconds": 120}},
+        )
 
     def test_source_event_identity_normalizes_user_name_case(self):
         upper = self._state(user_name="Bob")
