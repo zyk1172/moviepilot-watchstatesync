@@ -1104,7 +1104,7 @@ class WatchStateSyncTests(unittest.TestCase):
         server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
         target = types.SimpleNamespace(type="jellyfin", name="Jellyfin", instance=server)
         state = WATCHSTATESYNC.NormalizedState(
-            source_server="Plex", media_kind="movie", title="Movie", original_title=None,
+            source_server="Plex", source_type="plex", event_type="progress", user_name="alice", media_kind="movie", title="Movie", original_title=None,
             series_title=None, year=2026, tmdb_id=123, imdb_id=None, tvdb_id=None,
             season=None, episode=None, source_item_id="plex-1", progress_ms=1000,
             duration_ms=10000, watched=False, percent=10.0, played_at=None,
@@ -1139,7 +1139,7 @@ class WatchStateSyncTests(unittest.TestCase):
         server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
         target = types.SimpleNamespace(type="jellyfin", name="Jellyfin", instance=server)
         state = WATCHSTATESYNC.NormalizedState(
-            source_server="Plex", media_kind="episode", title="Episode", original_title=None,
+            source_server="Plex", source_type="plex", event_type="progress", user_name="alice", media_kind="episode", title="Episode", original_title=None,
             series_title="Series", year=2026, tmdb_id=None, imdb_id=None, tvdb_id=None,
             season=1, episode=2, source_item_id="plex-2", progress_ms=1000,
             duration_ms=10000, watched=False, percent=10.0, played_at=None,
