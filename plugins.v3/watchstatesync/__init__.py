@@ -1805,11 +1805,12 @@ class WatchStateSync(_PluginBase):
                 str(state.episode or 0),
             ])
         else:
-            provider_ids = getattr(state, "provider_ids", None) or {}
             provider_identity = "|".join(
-                f"{str(key).casefold()}={value}"
-                for key, value in sorted(provider_ids.items())
-                if value
+                value for value in [
+                    f"tmdb={state.tmdb_id}" if state.tmdb_id else "",
+                    f"imdb={state.imdb_id}" if state.imdb_id else "",
+                    f"tvdb={state.tvdb_id}" if state.tvdb_id else "",
+                ] if value
             )
             identity = provider_identity or "|".join([
                 self._normalize_title(state.title or state.original_title or ""),
