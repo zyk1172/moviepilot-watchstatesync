@@ -3230,6 +3230,10 @@ class WatchStateSync(_PluginBase):
             key: ts for key, ts in self._recent_writes.items()
             if (now - ts) < self._write_ttl_seconds
         }
+        self._target_item_cache = {
+            key: value for key, value in self._target_item_cache.items()
+            if (now - float((value or {}).get("ts") or 0)) < self._target_item_cache_ttl_seconds
+        }
 
     def _clear_history_data(self) -> Dict[str, Any]:
         with self._lock:
