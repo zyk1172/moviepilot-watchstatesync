@@ -1102,7 +1102,7 @@ class WatchStateSyncTests(unittest.TestCase):
 
     def test_target_item_cache_reuses_valid_match_and_evicts_404(self):
         server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
-        target = ServiceInfo("jellyfin", "Jellyfin", server)
+        target = schemas.ServiceInfo("jellyfin", "Jellyfin", server)
         state = NormalizedState(
             source_server="Plex", media_kind="movie", title="Movie", original_title=None,
             series_title=None, year=2026, tmdb_id=123, imdb_id=None, tvdb_id=None,
