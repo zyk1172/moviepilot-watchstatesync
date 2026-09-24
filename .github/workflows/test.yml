@@ -16,6 +16,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Validate plugin metadata
+        run: |
+          python -m json.tool package.json >/dev/null
+          python -m json.tool package.v2.json >/dev/null
+          python -m json.tool package.v3.json >/dev/null
+      - name: Compile plugin sources
+        run: |
+          python -m py_compile plugins.v2/watchstatesync/__init__.py
+          python -m py_compile plugins.v3/watchstatesync/__init__.py
       - name: Run unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
