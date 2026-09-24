@@ -103,6 +103,9 @@ class WatchStateSync(_PluginBase):
     _outbox_retry_max_seconds = 3600
     _jellyfin_auth_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
     _jellyfin_auth_ttl_seconds = 3600
+    _target_item_cache_ttl_seconds = 900
+    _target_item_cache_max_entries = 1000
+    _target_item_cache: Dict[str, Dict[str, Any]] = {}
     _plex_alert_listener: Any = None
     _plex_sessions: Dict[str, Dict[str, Any]] = {}
     _plex_user_identity_cache: Dict[str, List[str]] = {}
@@ -118,6 +121,7 @@ class WatchStateSync(_PluginBase):
         self._poll_lock = threading.RLock()
         self._recent_writes = {}
         self._jellyfin_auth_cache = {}
+        self._target_item_cache = {}
         self._plex_alert_listener = None
         self._plex_sessions = {}
         self._plex_user_identity_cache = {}
@@ -129,6 +133,7 @@ class WatchStateSync(_PluginBase):
         config = config or {}
         self._stop_plex_alert_listener()
         self._jellyfin_auth_cache = {}
+        self._target_item_cache = {}
         self._plex_sessions = {}
         self._plex_user_identity_cache = {}
         self._plex_user_servers = {}
@@ -1787,12 +1792,82 @@ class WatchStateSync(_PluginBase):
             source_sequence=source_sequence,
         )
 
-    def _find_target_item(self, target_service: ServiceInfo, state: NormalizedState) -> Optional[MediaServerItem]:
-        if state.media_kind == "movie":
-            return self._find_target_movie(target_service, state)
+    def _target_cache_key(self, target_service: ServiceInfo, state: NormalizedState) -> str:
+        """构造用户、服务器和媒体身份绑定的缓存键，避免跨用户/跨库串写。"""
+        server = target_service.instance
+        context = self._get_jellyfin_request_context(server)
+        user_id = self._coerce_str((context or {}).get("user_id")) or "__unknown__"
+        host = self._coerce_str(getattr(server, "_host", None)).rstrip("/")
         if state.media_kind == "episode":
-            return self._find_target_episode(target_service, state)
+            identity = "|".join([
+                self._normalize_title(state.series_title or state.title or ""),
+                str(state.season or 0),
+                str(state.episode or 0),
+            ])
+        else:
+            provider_ids = getattr(state, "provider_ids", None) or {}
+            provider_identity = "|".join(
+                f"{str(key).casefold()}={value}"
+                for key, value in sorted(provider_ids.items())
+                if value
+            )
+            identity = provider_identity or "|".join([
+                self._normalize_title(state.title or state.original_title or ""),
+                str(state.year or 0),
+            ])
+        return f"{host}|{user_id}|{state.media_kind}|{identity}"
+
+    def _get_cached_target_item(
+        self, target_service: ServiceInfo, state: NormalizedState
+    ) -> Optional[MediaServerItem]:
+        key = self._target_cache_key(target_service, state)
+        with self._lock:
+            cached = self._target_item_cache.get(key)
+            if not cached:
+                return None
+            if time.time() - float(cached.get("ts") or 0) >= self._target_item_cache_ttl_seconds:
+                self._target_item_cache.pop(key, None)
+                return None
+            item_id = self._coerce_str(cached.get("item_id"))
+        if not item_id:
+            return None
+        item = self._get_jellyfin_iteminfo(target_service.instance, item_id)
+        if item:
+            return item
+        with self._lock:
+            self._target_item_cache.pop(key, None)
         return None
+
+    def _cache_target_item(
+        self, target_service: ServiceInfo, state: NormalizedState, item: MediaServerItem
+    ):
+        item_id = self._coerce_str(getattr(item, "item_id", None))
+        if not item_id:
+            return
+        key = self._target_cache_key(target_service, state)
+        with self._lock:
+            self._target_item_cache[key] = {"item_id": item_id, "ts": time.time()}
+            if len(self._target_item_cache) > self._target_item_cache_max_entries:
+                oldest = sorted(
+                    self._target_item_cache.items(),
+                    key=lambda entry: float((entry[1] or {}).get("ts") or 0),
+                )
+                for stale_key, _ in oldest[:len(self._target_item_cache) - self._target_item_cache_max_entries]:
+                    self._target_item_cache.pop(stale_key, None)
+
+    def _find_target_item(self, target_service: ServiceInfo, state: NormalizedState) -> Optional[MediaServerItem]:
+        cached = self._get_cached_target_item(target_service, state)
+        if cached:
+            return cached
+        if state.media_kind == "movie":
+            item = self._find_target_movie(target_service, state)
+        elif state.media_kind == "episode":
+            item = self._find_target_episode(target_service, state)
+        else:
+            item = None
+        if item:
+            self._cache_target_item(target_service, state, item)
+        return item
 
     def _find_target_movie(self, target_service: ServiceInfo, state: NormalizedState) -> Optional[MediaServerItem]:
         if target_service.type != "jellyfin":
@@ -3143,6 +3218,7 @@ class WatchStateSync(_PluginBase):
             if force:
                 self._recent_writes = {}
                 self._jellyfin_auth_cache = {}
+                self._target_item_cache = {}
                 self._plex_user_servers = {}
                 return
             self._cleanup_caches_locked()
