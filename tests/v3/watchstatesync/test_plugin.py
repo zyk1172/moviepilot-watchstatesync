@@ -1102,8 +1102,8 @@ class WatchStateSyncTests(unittest.TestCase):
 
     def test_target_item_cache_reuses_valid_match_and_evicts_404(self):
         server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
-        target = schemas.ServiceInfo("jellyfin", "Jellyfin", server)
-        state = NormalizedState(
+        target = types.SimpleNamespace(type="jellyfin", name="Jellyfin", instance=server)
+        state = WATCHSTATESYNC.NormalizedState(
             source_server="Plex", media_kind="movie", title="Movie", original_title=None,
             series_title=None, year=2026, tmdb_id=123, imdb_id=None, tvdb_id=None,
             season=None, episode=None, source_item_id="plex-1", progress_ms=1000,
@@ -1137,8 +1137,8 @@ class WatchStateSyncTests(unittest.TestCase):
 
     def test_target_item_cache_is_scoped_by_jellyfin_user(self):
         server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
-        target = ServiceInfo("jellyfin", "Jellyfin", server)
-        state = NormalizedState(
+        target = types.SimpleNamespace(type="jellyfin", name="Jellyfin", instance=server)
+        state = WATCHSTATESYNC.NormalizedState(
             source_server="Plex", media_kind="episode", title="Episode", original_title=None,
             series_title="Series", year=2026, tmdb_id=None, imdb_id=None, tvdb_id=None,
             season=1, episode=2, source_item_id="plex-2", progress_ms=1000,
