@@ -6,6 +6,7 @@
     "version": "1.2.1",
     "icon": "sync_file.png",
     "author": "OpenAI Codex",
-    "level": 1
+    "level": 1,
+    "v3": false
   }
 }
