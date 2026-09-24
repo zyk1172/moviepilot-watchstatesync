@@ -3,10 +3,13 @@
     "name": "观看进度同步",
     "description": "[Beta] 将 Plex 的已看状态与继续观看进度单向同步到 Jellyfin。",
     "labels": "媒体服务器,同步,Plex,Jellyfin,单向,Beta,实验性",
-    "version": "1.2.1",
+    "version": "2.0.0",
     "icon": "sync_file.png",
     "author": "OpenAI Codex",
     "level": 1,
-    "v3": false
+    "system_version": ">=3.0.0",
+    "history": {
+      "v2.0.0": "适配 MoviePilot V3：迁移至稳定 SDK 入口，保留 Plex→Jellyfin 单向同步、轮询/WebSocket、Outbox 重试与用户隔离，并将运行时锁和缓存改为实例级。"
+    }
   }
 }

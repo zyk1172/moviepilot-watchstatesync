@@ -7,6 +7,7 @@
     "icon": "sync_file.png",
     "author": "OpenAI Codex",
     "level": 1,
-    "v2": true
+    "v2": true,
+    "v3": false
   }
 }

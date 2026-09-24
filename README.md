@@ -4,7 +4,7 @@
 
 ## Beta 状态
 
-当前仓库处于 `beta` 阶段，版本为 `1.2.1`，定位很明确：
+当前仓库处于 `beta` 阶段：V2 版本为 `1.2.1`，V3 版本为 `2.0.0`。定位很明确：
 
 - 只做 `Plex -> Jellyfin`
 - 不再支持双向同步
@@ -63,4 +63,12 @@
 - 每次写回后都会重新读取 Jellyfin UserData；验证失败会重试一次并保留 Outbox
 - Outbox 保存源事件时间和序列号；同一媒体用户只保留最新待处理状态，检测到目标已有更高进度时会丢弃旧重试，避免进度倒退
 - `sync_now`、`clear_history` 和 `diagnostics` API 均要求 Bearer 认证；当前 V2 Vuetify 页面不提交未认证的原生表单
-- 当前插件实现仍是 MoviePilot V2（`package.v2.json` / `plugins.v2`），不包含 V3 实现
+- V2 与 V3 使用独立实现目录：`plugins.v2/watchstatesync` 与 `plugins.v3/watchstatesync`
+- V3 实现使用 MoviePilot 稳定 SDK 入口（`app.sdk.*`），要求 MoviePilot `>=3.0.0`
+- V3 的运行时锁、WebSocket 监听器与瞬态缓存按插件实例隔离，避免克隆/多实例互相影响
+
+## MoviePilot V3
+
+V3 使用 `package.v3.json` 与 `plugins.v3/watchstatesync`。V2 索引显式声明 `v3: false`，因此 V3 不会回退加载 V2 兼容层实现。
+
+V3 保持与 V2 相同的同步语义和配置键，升级后无需重新设计同步策略；核心差异仅是宿主 SDK 导入与运行时实例隔离。
