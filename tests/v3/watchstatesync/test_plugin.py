@@ -1100,5 +1100,55 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertIsNone(second._plex_alert_listener)
 
 
+    def test_target_item_cache_reuses_valid_match_and_evicts_404(self):
+        server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
+        target = ServiceInfo("jellyfin", "Jellyfin", server)
+        state = NormalizedState(
+            source_server="Plex", media_kind="movie", title="Movie", original_title=None,
+            series_title=None, year=2026, tmdb_id=123, imdb_id=None, tvdb_id=None,
+            season=None, episode=None, source_item_id="plex-1", progress_ms=1000,
+            duration_ms=10000, watched=False, percent=10.0, played_at=None,
+        )
+        self.plugin._target_item_cache = {}
+        calls = {"search": 0, "lookup": 0}
+        item = types.SimpleNamespace(item_id="jf-1")
+
+        def search(_target, _state):
+            calls["search"] += 1
+            return item
+
+        def lookup(_server, item_id, context=None):
+            calls["lookup"] += 1
+            return types.SimpleNamespace(item_id=item_id)
+
+        self.plugin._find_target_movie = search
+        self.plugin._get_jellyfin_iteminfo = lookup
+
+        first = self.plugin._find_target_item(target, state)
+        second = self.plugin._find_target_item(target, state)
+        self.assertEqual(first.item_id, "jf-1")
+        self.assertEqual(second.item_id, "jf-1")
+        self.assertEqual(calls["search"], 1)
+        self.assertEqual(calls["lookup"], 1)
+
+        self.plugin._get_jellyfin_iteminfo = lambda *_args, **_kwargs: None
+        self.plugin._find_target_item(target, state)
+        self.assertEqual(calls["search"], 2)
+
+    def test_target_item_cache_is_scoped_by_jellyfin_user(self):
+        server = types.SimpleNamespace(_host="http://jellyfin/", user="user-1", _apikey="api")
+        target = ServiceInfo("jellyfin", "Jellyfin", server)
+        state = NormalizedState(
+            source_server="Plex", media_kind="episode", title="Episode", original_title=None,
+            series_title="Series", year=2026, tmdb_id=None, imdb_id=None, tvdb_id=None,
+            season=1, episode=2, source_item_id="plex-2", progress_ms=1000,
+            duration_ms=10000, watched=False, percent=10.0, played_at=None,
+        )
+        key_one = self.plugin._target_cache_key(target, state)
+        server.user = "user-2"
+        key_two = self.plugin._target_cache_key(target, state)
+        self.assertNotEqual(key_one, key_two)
+
+
 if __name__ == "__main__":
     unittest.main()
