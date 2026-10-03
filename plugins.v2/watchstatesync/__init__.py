@@ -897,15 +897,24 @@ class WatchStateSync(_PluginBase):
                 "user_name": state.user_name,
             }
             if last_sec >= 0 and abs(sec - last_sec) < self._progress_delta_seconds:
-                current_snapshot[snapshot_id] = snapshot_entry
+                # Keep the last handled baseline; moving it on every poll can
+                # prevent gradual progress from ever reaching the sync delta.
+                current_snapshot[snapshot_id] = last_entry
                 continue
             if last_sec < 0 and sec < self._min_progress_seconds:
-                current_snapshot[snapshot_id] = snapshot_entry
+                if last_entry is not None:
+                    current_snapshot[snapshot_id] = last_entry
                 continue
             result = self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
             # 失败时不推进快照，下一轮继续重试；成功/跳过才更新快照。
             if result != "failed":
                 current_snapshot[snapshot_id] = snapshot_entry
+            else:
+                current_snapshot[snapshot_id] = last_entry if last_entry is not None else {
+                    "seconds": -1,
+                    "user_id": state.user_id,
+                    "user_name": state.user_name,
+                }
 
         # Continue Watching 消失不等于已看。只回源确认 Plex 的最终 isPlayed/百分比，
         # 确认完成后才生成 WATCHED 操作；未完成的条目直接丢弃本轮快照。
@@ -1862,7 +1871,7 @@ class WatchStateSync(_PluginBase):
     def _find_target_episode(self, target_service: ServiceInfo, state: NormalizedState) -> Optional[MediaServerItem]:
         if target_service.type != "jellyfin":
             return None
-        if not state.season or not state.episode:
+        if state.season is None or not state.episode:
             return None
 
         # 先用 Series 层 provider id 找剧，再按季号/集号找 Episode；
@@ -2783,26 +2792,35 @@ class WatchStateSync(_PluginBase):
         state.user_name = user_name or state.user_name
         sec = int(state.progress_ms / 1000)
         with self._lock:
-            last = self._plex_sessions.get(session_key, {}).get("last_sec")
+            previous_session = dict(self._plex_sessions.get(session_key) or {})
+        last = previous_session.get("last_synced_sec", previous_session.get("last_sec"))
         if last is not None and abs(sec - last) < self._progress_delta_seconds:
             with self._lock:
-                self._plex_sessions[session_key] = {
-                    "item_key": str(item_key),
-                    "last_sec": sec,
-                    "state": state_name,
-                    "user_id": state.user_id,
-                    "user_name": state.user_name,
-                }
+                previous_session.update({
+                    "item_key": str(item_key), "state": state_name,
+                    "user_id": state.user_id, "user_name": state.user_name,
+                })
+                self._plex_sessions[session_key] = previous_session
             return
+        if last is None and not self._should_sync(
+                state.progress_ms, state.duration_ms, state.watched, state.operation):
+            with self._lock:
+                previous_session.update({
+                    "item_key": str(item_key), "state": state_name,
+                    "user_id": state.user_id, "user_name": state.user_name,
+                })
+                self._plex_sessions[session_key] = previous_session
+            return
+        result = self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
         with self._lock:
-            self._plex_sessions[session_key] = {
-                "item_key": str(item_key),
-                "last_sec": sec,
-                "state": state_name,
-                "user_id": state.user_id,
-                "user_name": state.user_name,
-            }
-        self._sync_state_to_target(source_service.name, target_service.name, target_service, state)
+            previous_session.update({
+                "item_key": str(item_key), "state": state_name,
+                "user_id": state.user_id, "user_name": state.user_name,
+            })
+            if result != "failed":
+                previous_session["last_sec"] = sec
+                previous_session["last_synced_sec"] = sec
+            self._plex_sessions[session_key] = previous_session
 
     def _reconcile_plex_sessions(self, source_service: ServiceInfo, target_service: ServiceInfo):
         if not self._plex_sessions:

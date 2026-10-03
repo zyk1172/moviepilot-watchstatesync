@@ -396,6 +396,32 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(len(synced), 1)
         self.assertEqual(synced[0].user_name, "alice")
 
+    def test_poll_resume_keeps_last_handled_progress_baseline(self):
+        source = FakeService("plex", "plex", FakeSourceInstance(FakePlex()))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        current = {"seconds": 80}
+        self.plugin._get_plex_resume_items = lambda *_args, **_kwargs: [types.SimpleNamespace(id="item-1")]
+        self.plugin._effective_source_user_fields = lambda _service: ("7", "alice")
+        self.plugin._build_plex_resume_state = lambda *_args, **_kwargs: self._state(
+            source_item_id="item-1", progress_ms=current["seconds"] * 1000
+        )
+        self.plugin._test_data["plex_resume_snapshot::plex"] = {
+            "item-1": {"seconds": 60, "user_id": "7", "user_name": "alice"}
+        }
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1].progress_ms // 1000) or "success"
+
+        self.plugin._poll_plex_resume(source, target)
+        current["seconds"] = 100
+        self.plugin._poll_plex_resume(source, target)
+        current["seconds"] = 120
+        self.plugin._poll_plex_resume(source, target)
+
+        self.assertEqual(synced, [100])
+        self.assertEqual(
+            self.plugin._test_data["plex_resume_snapshot::plex"]["item-1"]["seconds"], 100
+        )
+
     def test_resume_source_event_uses_observation_time(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
         item.lastViewedAt = datetime.fromtimestamp(100, tz=timezone.utc)
@@ -439,6 +465,20 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(state.series_tvdb_id, "show-111")
         self.assertEqual(state.episode_tvdb_id, "episode-222")
 
+    def test_special_episode_in_season_zero_matches_target(self):
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        marker = object()
+        self.plugin._find_jellyfin_series_id_fallback = lambda *_args: "show-id"
+        self.plugin._find_jellyfin_episode_item = lambda _service, _show, season, episode: (
+            marker if season == 0 and episode == 1 else None
+        )
+
+        result = self.plugin._find_target_episode(
+            target, self._state(media_kind="episode", season=0, episode=1)
+        )
+
+        self.assertIs(result, marker)
+
     def test_websocket_uses_notification_key_and_session_user(self):
         item = PlexItem(viewOffset=30 * 1000, duration=3600 * 1000)
         session = types.SimpleNamespace(
@@ -469,6 +509,35 @@ class WatchStateSyncTests(unittest.TestCase):
         self.assertEqual(synced[0].user_name, "bob")
         self.assertEqual(synced[0].user_id, "7")
         self.assertEqual(synced[0].progress_ms, 180 * 1000)
+
+    def test_websocket_keeps_last_handled_progress_baseline(self):
+        session = types.SimpleNamespace(
+            sessionKey="session-1", user=types.SimpleNamespace(id="7", title="bob")
+        )
+        source = FakeService("plex", "plex", FakeSourceInstance(FakePlex(sessions=[session])))
+        target = FakeService("jellyfin", "jellyfin", types.SimpleNamespace())
+        self.plugin._enabled = True
+        self.plugin._server_a = "plex"
+        self.plugin._server_b = "jellyfin"
+        self.plugin._allowed_users = ["bob"]
+        self.plugin._get_service = lambda name: source if name == "plex" else target
+        current = {"seconds": 60}
+        self.plugin._build_plex_resume_state = lambda *_args, **_kwargs: self._state(
+            source_item_id="5033", progress_ms=current["seconds"] * 1000
+        )
+        synced = []
+        self.plugin._sync_state_to_target = lambda *_args: synced.append(_args[-1].progress_ms // 1000) or "success"
+
+        for seconds in range(60, 121, 5):
+            current["seconds"] = seconds
+            self.plugin._handle_plex_alert_notification({
+                "ratingKey": "5033", "key": "/library/metadata/5033",
+                "sessionKey": "session-1", "state": "playing",
+                "viewOffset": seconds * 1000,
+            })
+
+        self.assertEqual(synced, [60, 90, 120])
+        self.assertEqual(self.plugin._plex_sessions["session-1"]["last_sec"], 120)
 
     def test_websocket_numeric_rating_key_fallback_is_integer(self):
         item = PlexItem(viewOffset=120 * 1000, duration=3600 * 1000)
